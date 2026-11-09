@@ -19,7 +19,9 @@ pub const text = @import("text.zig");
 /// Shorthand so the CLI can annotate name-based (JSON) task tables.
 pub const Config = parser.Config;
 
-/// Shorthand so an application root can write `pub const config: rticz.ResourceConfig`.
+/// Shorthand so an application root can annotate its system definition
+/// `pub const config: rticz.ResourceConfig(context.idle)` — generic
+/// over the idle context type because the runtime *calls* idle.
 pub const ResourceConfig = resource.Config;
 
 /// One task of a `ResourceConfig`, referencing its handler and its resource
@@ -28,18 +30,27 @@ pub const ResourceTask = resource.Task;
 
 /// The required signature of the init handler: `fn() void` — it runs
 /// before contexts exist.  Interrupt task handlers take their own
-/// context struct instead — a plain struct named after the interrupt,
+/// context struct instead — a plain struct named after the task,
 /// generated into src/generated/context.zig — so the task table
 /// references them by erased address.
 pub const Handler = resource.Handler;
 
-/// The required signature of the idle handler: `fn() noreturn`.
-pub const IdleHandler = resource.IdleHandler;
+/// What the idle task declares before its handler is attached: its
+/// resource accesses — the handler-free input the context generator
+/// emits `context.idle` from.
+pub const IdleSpec = resource.IdleSpec;
 
 /// The idle task as declared in the system definition: referenced
 /// handler and resource list — no priority, since idle *is* logical
-/// priority 0.
+/// priority 0.  Generic over the idle context type: the glue calls
+/// idle, so its reference stays typed (`*const fn (*IdleCtx) noreturn`).
 pub const IdleTask = resource.IdleTask;
+
+/// A claimed-for-the-moment resource proxy — the type of a context
+/// field.  An app handler names it only through its context
+/// (`ctx.res.claim(...)`); the shorthand is here so a signature or
+/// helper can spell the type if it needs to.
+pub const Claim = resource.Claim;
 
 test {
     std.testing.refAllDecls(parser);

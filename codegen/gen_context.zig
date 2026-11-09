@@ -7,27 +7,28 @@
 //! task, the context struct its handler's signature will name —
 //!
 //! ```zig
-//! pub const TIMER0 = struct {
-//!     res_a: *@TypeOf(app.res_a),
-//!     res_b: *@TypeOf(app.res_b),
+//! pub const t0 = struct {
+//!     res_a: rticz.resource.Claim(@TypeOf(app.res_a)),
+//!     res_b: rticz.resource.Claim(@TypeOf(app.res_b)),
 //! };
 //! ```
 //!
-//! — typed as pointers into the application's own declarations, so
+//! — each a `Claim` proxy over the application's own declaration, so
 //! the context always reaches the very instances the task claimed,
 //! whatever section or alignment those carry.
 //!
 //! The chicken-and-egg this creates, and how it is broken, mirrors
 //! the vector generator — one floor deeper:
 //!
-//! *   a handler's signature names its context (`ctx: context.TIMER0`),
+//! *   a handler's signature names its context (`ctx: context.t0`),
 //!     so no handler can compile before the contexts exist;
 //! *   therefore this generator must *not* read anything that drags
-//!     handlers along.  It reads `app.task_specs` — interrupt lines,
-//!     priorities, and named resource accesses, a declaration with no
-//!     function references in it.  Materializing that list forces the
-//!     analysis of nothing but the resource addresses; the handlers
-//!     stay unanalyzed, their unresolvable signatures never looked at.
+//!     handlers along.  It reads `app.task_specs` — task names,
+//!     interrupt lines, priorities, and named resource accesses — and
+//!     `app.idle_spec`, declarations with no function references in
+//!     them.  Materializing those lists forces the analysis of
+//!     nothing but the resource addresses; the handlers stay
+//!     unanalyzed, their unresolvable signatures never looked at.
 //!
 //! build.zig wires this generator's copy of the app against the
 //! committed stubs codegen/context_stub.zig (empty: nothing here resolves
@@ -36,11 +37,18 @@
 //! the app against the freshly generated contexts — which is where
 //! the handler signatures are finally checked.
 //!
-//! The contexts are named after the *interrupt*, not the handler:
-//! from `task_specs` a generator sees `TIMER0` before any handler is
-//! bound to it, and naming by handler would require reading the
-//! bound task list — dragging handlers back into the pass that must
-//! not see them.
+//! The contexts are named after the *task*, exactly as RTIC hands
+//! `Context<T0>` to the task named `t0` — and the name is read from
+//! the spec, where the application declared it as a plain string.
+//! The handler's declared name would be the one-stop truth, but
+//! reading it means analyzing the handler, the very thing this pass
+//! must not do; the vector generator, which does see handlers,
+//! checks the two agree.  Idle gets `context.idle`: one idle per
+//! system, its resources declared in `app.idle_spec`; and because
+//! idle's single activation outlives any trampoline frame — it *is*
+//! the runtime loop — the generator emits the one constructor the
+//! glue needs, `makeIdleCtx`, so the context literal lives beside the
+//! struct it constructs and cannot drift from it.
 //!
 //! The output is written into the tree at src/generated/context.zig —
 //! git-ignored, but visible, so anyone can read exactly what the
@@ -67,15 +75,17 @@ const header =
     \\//! `zig build`, which rewrites this file on every run.
     \\//! Git-ignored: here to be read, not to be committed.
     \\//!
-    \\//! One struct per interrupt, named after it: the fields are the
-    \\//! resources that interrupt's task declared, typed as pointers
-    \\//! into the application's own declarations — so a handler
-    \\//! reaches exactly the instances it claimed, and the generated
+    \\//! One struct per task, named after the task (plus `idle`, the
+    \\//! runtime's own context): the fields are that task's declared
+    \\//! resources, each a `Claim` proxy over the application's own
+    \\//! declaration — so a handler reaches the instance it claimed,
+    \\//! and only inside a claimed critical section, and the generated
     \\//! vector's context literal is checked against this struct,
     \\//! field for field and type for type.
     \\
     \\
     \\const app = @import("app");
+    \\const rticz = @import("rticz");
     \\
     \\
 ;
@@ -106,50 +116,103 @@ pub fn main(init: std.process.Init) !void {
 
     try w.writeAll(header);
 
-    // One context struct per declared task.  `app.task_specs`, not
+    // One context struct per declared task — named after the task —
+    // and one for idle.  `app.task_specs` and `app.idle_spec`, not
     // `app.tasks` and never `app.config` — see the module comment for
-    // why the handler-free list is the only input this pass may read.
-    // Every name written below must be a valid Zig identifier: the
-    // interrupt names the struct, the resource names its fields.
-    var seen: [app.task_specs.len][]const u8 = undefined;
+    // why the handler-free declarations are the only input this pass
+    // may read.  Every name written below must be a valid Zig
+    // identifier: the task names the struct, the resource names its
+    // fields.
+    var seen: [app.task_specs.len + 1][]const u8 = undefined;
+    var seen_irqs: [app.task_specs.len][]const u8 = undefined;
     for (app.task_specs, 0..) |spec, i| {
+        if (!rticz.parser.isZigIdentifier(spec.name)) {
+            std.debug.print("gen_context: task name '{s}' is not a valid Zig identifier, " ++
+                "so no context struct can be generated for it\n", .{spec.name});
+            std.process.exit(1);
+        }
         if (!rticz.parser.isZigIdentifier(spec.interrupt_id)) {
             std.debug.print("gen_context: interrupt_id '{s}' is not a valid Zig identifier, " ++
                 "so no context struct can be generated for it\n", .{spec.interrupt_id});
             std.process.exit(1);
         }
         for (seen[0..i]) |earlier| {
+            if (std.mem.eql(u8, earlier, spec.name)) {
+                std.debug.print("gen_context: two tasks are named '{s}'; a task name names its " ++
+                    "context struct, so it must be unique\n", .{spec.name});
+                std.process.exit(1);
+            }
+        }
+        for (seen_irqs[0..i]) |earlier| {
             if (std.mem.eql(u8, earlier, spec.interrupt_id)) {
                 std.debug.print("gen_context: two tasks claim interrupt '{s}'; one interrupt, one context\n", .{spec.interrupt_id});
                 std.process.exit(1);
             }
         }
-        seen[i] = spec.interrupt_id;
+        seen[i] = spec.name;
+        seen_irqs[i] = spec.interrupt_id;
 
-        try w.print("/// ctx for interrupt {s} (priority {d})\n", .{ spec.interrupt_id, spec.priority });
-        try w.print("pub const {s} = struct {{\n", .{spec.interrupt_id});
-        for (spec.resources, 0..) |res, ri| {
-            if (!rticz.parser.isZigIdentifier(res.name)) {
-                std.debug.print("gen_context: resource '{s}' is not a valid Zig identifier, " ++
-                    "so it cannot be a field of a context struct\n", .{res.name});
-                std.process.exit(1);
-            }
-            for (spec.resources[0..ri]) |earlier| {
-                if (std.mem.eql(u8, earlier.name, res.name)) {
-                    std.debug.print("gen_context: task on interrupt '{s}' lists resource '{s}' twice; " ++
-                        "a context has one field per resource\n", .{ spec.interrupt_id, res.name });
-                    std.process.exit(1);
-                }
-            }
-            // The field type names the application's declaration by
-            // `@TypeOf`, not by a type name printed here: whatever
-            // the programmer writes at the declaration — a generic
-            // instance, a typedef — flows into the context without
-            // this file ever going stale.
-            try w.print("    {s}: *@TypeOf(app.{s}),\n", .{ res.name, res.name });
-        }
+        try w.print("/// ctx for task {s} (interrupt {s}, priority {d})\n", .{ spec.name, spec.interrupt_id, spec.priority });
+        try w.print("pub const {s} = struct {{\n", .{spec.name});
+        try emitFields(w, spec.name, spec.resources);
         try w.print("}};\n\n", .{});
     }
 
+    // Idle is a task: `context.idle`, emitted from the handler-free
+    // `idle_spec` like any other.  Its name is not a declaration to
+    // validate — there is one idle and `idle` is its name — but a
+    // *task* named `idle` would collide with the idle context, and
+    // that is checkable here.
+    for (seen[0..app.task_specs.len]) |name| {
+        if (std.mem.eql(u8, name, "idle")) {
+            std.debug.print("gen_context: a task named 'idle' collides with the idle task's context\n", .{});
+            std.process.exit(1);
+        }
+    }
+    try w.print("/// ctx for task idle (no interrupt, logical priority 0)\n", .{});
+    try w.print("pub const idle = struct {{\n", .{});
+    try emitFields(w, "idle", app.idle_spec.resources);
+    try w.print("}};\n\n", .{});
+
+    // Idle's activation is not a trampoline frame — it is the whole
+    // runtime loop — so its context is built once, by whoever enters
+    // idle.  The constructor is emitted rather than handwritten by
+    // the glue for the same reason the structs are: it names the
+    // application's declarations by address (`&app.res_x`), so it can
+    // never drift from the declaration that claimed them.  The
+    // proxies come fresh with it, and live exactly as long as idle
+    // runs — which is forever.
+    try w.print("pub fn makeIdleCtx() idle {{\n    return .{{", .{});
+    for (app.idle_spec.resources, 0..) |res, j| {
+        try w.print("{s} .{s} = .{{ .ptr = &app.{s} }}", .{ if (j != 0) "," else "", res.name, res.name });
+    }
+    try w.print(" }};\n}}\n", .{});
+
     try w.flush();
+}
+
+/// One context's fields: the resources the task declared, each a
+/// `Claim` proxy whose pointee type the application's declaration
+/// itself states — `@TypeOf(app.res_x)`, not a type name printed
+/// here: whatever the programmer writes at the declaration — a
+/// generic instance, a typedef — flows into the context without this
+/// file ever going stale.  Wrapped in `Claim`, the field hands the
+/// handler a proxy, not the reference: only `claim` opens it, and
+/// only for a critical section.
+fn emitFields(w: *Io.Writer, owner: []const u8, resources: []const rticz.resource.ResourceRef) !void {
+    for (resources, 0..) |res, ri| {
+        if (!rticz.parser.isZigIdentifier(res.name)) {
+            std.debug.print("gen_context: resource '{s}' is not a valid Zig identifier, " ++
+                "so it cannot be a field of a context struct\n", .{res.name});
+            std.process.exit(1);
+        }
+        for (resources[0..ri]) |earlier| {
+            if (std.mem.eql(u8, earlier.name, res.name)) {
+                std.debug.print("gen_context: task '{s}' lists resource '{s}' twice; " ++
+                    "a context has one field per resource\n", .{ owner, res.name });
+                std.process.exit(1);
+            }
+        }
+        try w.print("    {s}: rticz.resource.Claim(@TypeOf(app.{s})),\n", .{ res.name, res.name });
+    }
 }

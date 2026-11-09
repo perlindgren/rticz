@@ -7,9 +7,10 @@
 //! in the Zig compiler proper, so it is the piece of the system that
 //! genuinely needs codegen beyond the contexts: this tool emits, per
 //! config task, a trampoline named after the task's `interrupt_id`
-//! that *creates the task's context* — one field per accessed
-//! resource, referencing the very declarations the task claimed —
-//! and calls the handler with it.
+//! that *creates the task's context* — one `Claim` proxy per accessed
+//! resource, pointing at the very declaration the task claimed — and
+//! calls the handler with a pointer to it, so the handler can open
+//! each resource only through `claim`.
 //!
 //! The chicken-and-egg this creates, and how it is broken:
 //!
@@ -61,13 +62,18 @@ const header =
     \\//! On real hardware these names are the symbols the linker places
     \\//! in the vector table; on the host they are plain functions the
     \\//! idle task calls in place of firing the interrupt line.
-    \\//! Each one builds its interrupt's context struct — from the
-    \\//! sibling generated module, src/generated/context.zig — and
-    \\//! calls the handler with it: the call type-checks the task's
-    \\//! whole declaration, handler signature included.
+    \\//! Each one builds its task's context struct — the sibling
+    \\//! generated module names contexts after their task, so this is
+    \\//! `context.t0`, not `context.TIMER0` — filling each field with
+    \\//! a `Claim` proxy over the application's declaration, then
+    \\//! calls the handler with a pointer to it: the call type-checks
+    \\//! the task's whole declaration, handler signature included, and
+    \\//! the handler reaches each resource only by `claim`ing its
+    \\//! proxy.
     \\
     \\
     \\const app = @import("app");
+    \\const context = @import("context");
     \\
     \\
 ;
@@ -129,6 +135,19 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
 
+        // RTIC's rule, enforced here: a task is named after its
+        // handler, and the context — emitted by codegen/gen_context.zig
+        // from the spec's `name`, the only handler-free way a name can
+        // reach that pass — is named after the task.  This pass sees
+        // the handler's actual declared name; if the two disagree,
+        // say so plainly instead of letting the next compile fail on
+        // a `context.<declared name>` that was never emitted.
+        if (!std.mem.eql(u8, task.name, handler_name)) {
+            std.debug.print("extract: task '{s}' is bound to a handler declared as '{s}'; " ++
+                "a task and its handler share one name — rename the handler, or fix the spec\n", .{ task.name, handler_name });
+            std.process.exit(1);
+        }
+
         // The context literal's fields: the names the task claimed,
         // carried by its access list — the same list codegen/gen_context.zig
         // emitted the handler's context struct from, so the literal
@@ -136,16 +155,24 @@ pub fn main(init: std.process.Init) !void {
         // field and type for type, against what the handler declares
         // it receives.  This line is where the erased `task_id`
         // reference gets its type checked.
-        try w.print("/// interrupt {s} → task {s} (ctx: ", .{ task.interrupt_id, handler_name });
+        try w.print("/// interrupt {s} → task {s} (ctx: ", .{ task.interrupt_id, task.name });
         for (task.resources, 0..) |res, j| {
             try w.print("{s}{s}", .{ if (j != 0) ", " else "", res.name });
         }
         try w.print(")\n", .{});
-        try w.print("pub fn {s}() void {{ app.{s}(.{{", .{ task.interrupt_id, handler_name });
+        try w.print("pub fn {s}() void {{\n", .{task.interrupt_id});
+        // The proxies live inside this activation's context: their
+        // `claimed` guards therefore live exactly as long as the run,
+        // and the handler — reached through a pointer — shares the
+        // one guard per resource with every copy of the context.
+        // Annotated with the generated type, so the literal and the
+        // handler's signature close over each other: pairing a
+        // handler with the wrong spec is a type error, here.
+        try w.print("    var ctx: context.{s} = .{{", .{task.name});
         for (task.resources, 0..) |res, j| {
-            try w.print("{s} .{s} = &app.{s}", .{ if (j != 0) "," else "", res.name, res.name });
+            try w.print("{s} .{s} = .{{ .ptr = &app.{s} }}", .{ if (j != 0) "," else "", res.name, res.name });
         }
-        try w.print(" }}); }}\n\n", .{});
+        try w.print(" }};\n    app.{s}(&ctx);\n}}\n\n", .{handler_name});
     }
 
     try w.flush();

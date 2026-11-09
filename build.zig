@@ -56,23 +56,26 @@ pub fn build(b: *std.Build) void {
     // the tree for anyone to read, rewritten on every build):
     //
     //   * `context.zig` — RTIC's per-task context structs, one per
-    //     interrupt, named after it (`context.TIMER0`).  A handler's
-    //     signature names its context, so no handler can compile
-    //     before the contexts exist: the context generator must read
-    //     a handler-free view of the app — `pub const task_specs`
-    //     (interrupt lines, priorities, named resource accesses; no
-    //     function references in it, so reading it forces no handler
-    //     analysis).  `codegen/gen_context.zig` emits the structs, typed
-    //     `*@TypeOf(app.res_x)` over the application's own resource
-    //     declarations.
+    //     task, named after it (`context.t0`, RTIC's `Context<T0>`),
+    //     plus `context.idle` and the `makeIdleCtx` constructor the
+    //     glue uses to enter idle.  A handler's signature names its
+    //     context, so no handler can compile before the contexts
+    //     exist: the context generator must read a handler-free view
+    //     of the app — `pub const task_specs` (task names, interrupt
+    //     lines, priorities, named resource accesses; no function
+    //     references in it, so reading it forces no handler analysis)
+    //     and `pub const idle_spec`.  `codegen/gen_context.zig` emits
+    //     the structs, typed `*@TypeOf(app.res_x)` over the
+    //     application's own resource declarations.
     //   * `irq.zig` — one trampoline per interrupt (`pub fn TIMER0()
-    //     void { app.t0(.{ .res_a = &app.res_a }); }`); on hardware
-    //     these names are the symbols the linker drops into the
-    //     vector table.  `codegen/extract.zig` emits them from
-    //     `pub const tasks` — reading that list materializes the
-    //     handlers, which is fine now: the contexts exist by then,
-    //     and the trampoline's context literal is checked against
-    //     the handler's signature.
+    //     void { var ctx: context.t0 = .{ .res_a = .{ .ptr = &app.res_a } };
+    //     app.t0(&ctx); }`); on hardware these names are the symbols
+    //     the linker drops into the vector table.  `codegen/extract.zig`
+    //     emits them from `pub const tasks` — reading that list
+    //     materializes the handlers, which is fine now: the contexts
+    //     exist by then, the trampoline's context literal is checked
+    //     against the handler's signature, and the handler's declared
+    //     name is checked against the spec's task name.
     //
     // The two loops — generators need a compiled app, the app needs
     // their output — are broken by handing each compilation its own
@@ -159,6 +162,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
     contexts_for_extract.addImport("app", app_for_extract);
+    contexts_for_extract.addImport("rticz", mod); // its fields are `Claim` proxies
     app_for_extract.addImport("context", contexts_for_extract);
 
     const extract = b.addExecutable(.{
@@ -200,7 +204,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
     vectors_mod.addImport("app", app_mod);
+    vectors_mod.addImport("context", contexts_mod); // trampolines name their context type
     contexts_mod.addImport("app", app_mod);
+    contexts_mod.addImport("rticz", mod); // its fields are `Claim` proxies
     app_mod.addImport("vectors", vectors_mod);
     app_mod.addImport("context", contexts_mod);
 
@@ -214,6 +220,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "app", .module = app_mod },
             .{ .name = "rticz", .module = mod },
+            // The glue enters idle through the generated `makeIdleCtx`:
+            // even the runtime's one context literal is generated, from
+            // the same `idle_spec` the struct was emitted from.
+            .{ .name = "context", .module = contexts_mod },
         },
     });
     const exe = b.addExecutable(.{

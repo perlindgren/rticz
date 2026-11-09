@@ -17,6 +17,11 @@ const std = @import("std");
 const app = @import("app"); // the application root, src/root.zig — NOT
 const rticz = @import("rticz"); // @import("root"), which would be *this*
                                 // file when glue is the executable entry
+const context = @import("context"); // the generated task contexts: idle
+                                    // enters through the generated
+                                    // `makeIdleCtx`, just as the vectors
+                                    // enter interrupt tasks through
+                                    // generated context literals
 
 pub const config = app.config;
 
@@ -116,10 +121,16 @@ pub fn main(init: std.process.Init) !void {
     const init_fn = app.config.init;
     init_fn();
 
-    // idle is a task: the config references its handler; the glue
-    // enters it and it never returns.
+    // idle is a task: the config references its handler, and like
+    // every task it takes a context — the glue enters idle with the
+    // generated `makeIdleCtx`, whose literal lives in the same file
+    // as the struct, built from the same `idle_spec` the struct was
+    // emitted from.  Unlike a trampoline frame, this context lives
+    // exactly as long as idle's single activation: the runtime loop
+    // that never returns.
     const idle_fn = app.config.idle.task_id;
-    idle_fn();
+    var idle_ctx = context.makeIdleCtx();
+    idle_fn(&idle_ctx);
 }
 
 /// Print the system definition — tasks, ceilings, resources — read
@@ -217,8 +228,13 @@ test "idle appears as a task at logical priority 0, with its resources" {
     try std.testing.expectEqualStrings("idle", row.task_id);
     try std.testing.expectEqualStrings("none", row.interrupt_id);
     try std.testing.expectEqual(@as(u8, 0), row.priority);
-    try std.testing.expectEqual(@as(usize, 1), row.resources.len);
-    try std.testing.expectEqualStrings("res_c", row.resources[0]);
+    // Idle publishes the beat *through* the resources, so all three
+    // are access declarations — the ones `context.idle` was emitted
+    // from, the ones `makeIdleCtx` fills.
+    try std.testing.expectEqual(@as(usize, 3), row.resources.len);
+    try std.testing.expectEqualStrings("res_a", row.resources[0]);
+    try std.testing.expectEqualStrings("res_b", row.resources[1]);
+    try std.testing.expectEqualStrings("res_c", row.resources[2]);
 }
 
 test "init and idle are the functions the config references" {

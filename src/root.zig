@@ -8,13 +8,17 @@
 //! table from them at compile time, and prints the report in `main`.
 //! Nothing is parsed.  And even RTIC's per-task context structs are
 //! never handwritten: `codegen/gen_context.zig` reads `task_specs` and
-//! *emits* one context struct per interrupt into
+//! *emits* one context struct per task into
 //! `src/generated/context.zig`, imported as `context` below — a
-//! handler's signature simply names `context.TIMER0`, and nothing
+//! handler's signature simply names `context.t0`, and nothing
 //! else in this file mentions contexts at all.  (Named after the
-//! interrupt, not the handler: the generator runs from the
-//! handler-free declaration precisely so that no handler needs to
-//! compile before its own context exists.)
+//! task — RTIC's `Context<T0>` for task `t0` — the name declared in
+//! the spec as a plain string: the generator reads the handler-free
+//! declaration precisely so that no handler needs to compile before
+//! its own context exists, and only there the name can be data.  The
+//! vector generator checks the handler is declared under that same
+//! name.)  Idle is a task too: `context.idle`, from `idle_spec`, and
+//! the glue enters idle with the generated `makeIdleCtx`.
 //!
 //! Two modules are generated, both from what you see below, both in
 //! src/generated/ — visible, regenerated every build:
@@ -52,25 +56,40 @@ const context = @import("context");
 // regenerated on every build.
 const vectors = @import("vectors");
 
-/// The task declarations, handler-free by design: interrupt line,
-/// priority, and the resources the task accesses — each access a
-/// name-`&`-the-instance pair, so the *declaration* is where names
-/// are claimed, for the analysis, the generated contexts, and the
-/// generated trampolines alike.  The generators read only this list
-/// (never `config`): no handler must compile before the context its
-/// signature names exists, and reading a handler-free list forces no
-/// handler's analysis.
+/// The task declarations, handler-free by design: the task's name,
+/// its interrupt line, its priority, and the resources the task
+/// accesses — each access a name-`&`-the-instance pair, so the
+/// *declaration* is where names are claimed, for the analysis, the
+/// generated contexts, and the generated trampolines alike.  The
+/// task's name doubles as its context's name (`context.t0`), RTIC's
+/// convention; it is spelled here as a string because the generators
+/// read only this list (never `config`): no handler must compile
+/// before the context its signature names exists, and reading a
+/// handler-free list forces no handler's analysis — a declared
+/// function's name could not be read here without dragging its
+/// signature along.
 pub const task_specs = [_]rticz.resource.TaskSpec{
     .{
+        .name = "t0",
         .interrupt_id = "TIMER0",
         .priority = 1,
         .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b }),
     },
     .{
+        .name = "t1",
         .interrupt_id = "UART0",
         .priority = 2,
         .resources = rticz.resource.refs(.{ .res_b = &res_b, .res_c = &res_c }),
     },
+};
+
+/// Idle's declaration, handler-free like `task_specs` — it is the
+/// context generator's input for `context.idle`, so no function
+/// reference may ride along.  What idle touches: the beat is
+/// published *through* the resources, so all three are access
+/// declarations, read and written only inside claimed sections below.
+pub const idle_spec = rticz.resource.IdleSpec{
+    .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b, .res_c = &res_c }),
 };
 
 /// The interrupt tasks: the specs above, each bound to the handler
@@ -84,37 +103,44 @@ pub const task_specs = [_]rticz.resource.TaskSpec{
 /// which must type-check against the handler's own signature.
 pub const tasks: []const rticz.ResourceTask = &rticz.resource.bindHandlers(.{ t0, t1 }, &task_specs);
 
-pub const config: rticz.ResourceConfig = .{
+pub const config: rticz.ResourceConfig(context.idle) = .{
     // init and idle are tasks, so they are declared like tasks:
     // references to functions, no invented names.  init runs before
     // interrupts are enabled — nothing races it, so it declares no
     // resource list.  idle is the lowest-priority context: logical
     // priority 0 comes from being idle, not from a declaration, so it
-    // states only what is a choice — the resources it touches.
+    // states only what is a choice — the resources it touches — and
+    // it states them once, in `idle_spec`, the generator's input for
+    // the very `context.idle` this config's type names.
     .init = init,
     .idle = .{
         .task_id = idle,
-        .resources = rticz.resource.refs(.{ .res_c = &res_c }),
+        .resources = idle_spec.resources,
     },
 
     .tasks = tasks,
 };
 
-/// The interrupt tasks arrive with their context: every access to
-/// shared state goes through a field of it, never through the
-/// declarations directly — which is exactly what makes the task's
-/// resource list more than documentation.  The host build reaches
-/// handlers through the generated vector functions, which *create*
-/// the context instance — the same path the core takes on hardware,
-/// with idle's calls standing in for the interrupt lines firing.
+/// The interrupt tasks arrive with their context: a pointer to a
+/// struct of `Claim` proxies, one per resource the task declared.
+/// Shared state is reached *only* through a proxy, and only inside a
+/// `claim`ed critical section — the handler never holds the reference
+/// itself, which is what makes the task's resource list more than
+/// documentation.  `claim` takes the critical section and, next to
+/// it, the value that section would have captured (a Zig stand-in for
+/// a Rust closure environment; the empty capture is `{}`), lends the
+/// reference into the section, and retracts it on the way out.  The
+/// host build reaches handlers through the generated vector functions,
+/// which *build* the context — fresh proxies, so the guard lives for
+/// exactly one activation — and call the handler with a pointer to it.
 ///
 /// A handler referenced from the system definition is part of the
 /// application's visible surface: the framework resolves references by
 /// walking the module's *public* declarations, so `t0` and `t1` are
 /// `pub` — exactly what a name-based config could name across files.
-pub fn t0(ctx: context.TIMER0) void {
-    ctx.res_a.* += 1;
-    ctx.res_b.x += 1;
+pub fn t0(ctx: *context.t0) void {
+    ctx.res_a.claim(add_n, @as(u64, 1)); // capture: the amount to add
+    ctx.res_b.claim(bump_x, @as(u32, 1));
     // A handler can ask its own priority — from the config table, at
     // comptime, off the function's own address.
     comptime {
@@ -122,9 +148,27 @@ pub fn t0(ctx: context.TIMER0) void {
     }
 }
 
-pub fn t1(ctx: context.UART0) void {
-    ctx.res_b.y += 1;
-    ctx.res_c.set("from t1") catch {};
+pub fn t1(ctx: *context.t1) void {
+    ctx.res_b.claim(bump_y, @as(u32, 1));
+    ctx.res_c.claim(overwrite, "from t1");
+}
+
+// The critical sections above, written as the plain functions Zig
+// passes to `claim` in place of a closure: first parameter the
+// capture pack `claim` hands back, second the resource reference the
+// section is lent for its duration only.
+
+fn add_n(amount: u64, counter: *u64) void {
+    counter.* += amount;
+}
+fn bump_x(step: u32, point: *Position) void {
+    point.x += step;
+}
+fn bump_y(step: u32, point: *Position) void {
+    point.y += step;
+}
+fn overwrite(text: []const u8, label: *Label) void {
+    label.set(text) catch {};
 }
 
 /// The priority assigned to `handler` in the task table (which
@@ -195,36 +239,65 @@ pub fn init() void {
 }
 
 /// The idle loop: the lowest-priority context of the system (logical
-/// priority 0), running only while nothing else does.  It publishes
-/// the beat through `res_c` — the access the config declares for it —
-/// and enters the interrupt handlers *through their vector functions*,
-/// in the order the simulated priorities dictate; on real hardware the
-/// lines fire and the core enters those same functions from the vector
-/// table.
-pub fn idle() noreturn {
+/// priority 0), running only while nothing else does — and a task
+/// like any other, so it takes a context too: `context.idle`, built
+/// once by the glue with the generated `makeIdleCtx`, its one
+/// activation being this whole loop.  It publishes the beat *through*
+/// the resources — reads and writes all happen inside claimed
+/// sections, the way the declaration says — and enters the interrupt
+/// handlers *through their vector functions*, in the order the
+/// simulated priorities dictate; on real hardware the lines fire and
+/// the core enters those same functions from the vector table.
+pub fn idle(ctx: *context.idle) noreturn {
     var beat: usize = 0;
     while (true) : (beat += 1) {
         vectors.UART0();
         vectors.TIMER0();
 
-        // Publish the beat through the resource, not around it: the
-        // config says idle touches `res_c`, and here it does.
-        // `beat_msg_len` bounds the worst case, so neither format can
-        // overflow its buffer ("beat " + 20 digits ≤ 32 = capacity).
-        var msg_buf: [beat_msg_len]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "beat {d}", .{beat}) catch unreachable;
-        res_c.set(msg) catch unreachable;
-        std.debug.print("  [{d}] a={d} b=({d},{d}) c=\"{s}\"\n", .{
-            beat,
-            res_a,
-            res_b.x,
-            res_b.y,
-            res_c.slice(),
-        });
+        // The whole beat, published through claims: open `res_a` and
+        // carry everything the later sections will need in the
+        // capture — a context pointer and the beat count, the Zig
+        // stand-in for what a Rust closure would capture.
+        ctx.res_a.claim(read_a, IdleEnv{ .ctx = ctx, .beat = beat });
 
         // Sleep long enough to be unmissable, short enough to stop.
         sleep_ms(2_000);
     }
+}
+
+/// The capture packs idle's nested claims pass along.  Each level
+/// hands the next everything it may need, because a claimed section
+/// receives nothing else: the previous holdings, and the one
+/// reference this level borrows.  Nesting *different* resources is
+/// how accesses compose; the guards make that rule literal.
+const IdleEnv = struct { ctx: *context.idle, beat: usize };
+const WithA = struct { env: IdleEnv, a: u64 };
+const WithAB = struct { with_a: WithA, b: Position };
+
+fn read_a(env: IdleEnv, a: *u64) void {
+    env.ctx.res_b.claim(read_b, WithA{ .env = env, .a = a.* });
+}
+
+fn read_b(held: WithA, b: *Position) void {
+    held.env.ctx.res_c.claim(publish, WithAB{ .with_a = held, .b = b.* });
+}
+
+/// The innermost section: the beat message goes through `res_c`'s
+/// claim — the config says idle touches `res_c`, and here it does —
+/// and the snapshot printed is the one the enclosing claims carried
+/// in.  `beat_msg_len` bounds the worst case, so neither format can
+/// overflow its buffer ("beat " + 20 digits ≤ 32 = capacity).
+fn publish(held: WithAB, c: *Label) void {
+    var msg_buf: [beat_msg_len]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "beat {d}", .{held.with_a.env.beat}) catch unreachable;
+    c.set(msg) catch unreachable;
+    std.debug.print("  [{d}] a={d} b=({d},{d}) c=\"{s}\"\n", .{
+        held.with_a.env.beat,
+        held.with_a.a,
+        held.b.x,
+        held.b.y,
+        c.slice(),
+    });
 }
 
 /// The longest message idle can produce: "beat " + 20 digits of
