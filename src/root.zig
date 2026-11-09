@@ -5,8 +5,13 @@
 //!
 //! `config` is the single source of truth: the glue layer reads it,
 //! derives the resource ceilings and the task table from it at
-//! compile time, and prints the report in `main`.  Nothing is parsed
-//! and no code is generated; the Zig compiler *is* the generator.
+//! compile time, and prints the report in `main`.  Nothing is parsed,
+//! and the Zig compiler *is* the generator — for all but one thing:
+//! the interrupt vector table.  On hardware a task is reached through
+//! a function whose name is the vector's name, and no amount of
+//! comptime reflection places symbols in a vector table, so exactly
+//! one module is generated from this app: one trampoline per
+//! `interrupt_id`, by src/extract.zig, imported as `vectors` below.
 //!
 //! Handlers are plain file-scope functions, so a config entry is
 //! simply `.task_id = t0`.  A handler may as well come from another
@@ -15,6 +20,37 @@
 
 const std = @import("std");
 const rticz = @import("rticz");
+
+// The interrupt vector table: a module emitted by src/extract.zig
+// from the task list below, during the build.  The import is a
+// deliberate cycle — the vectors import "app" to reach the handlers,
+// and the app imports "vectors" to call them — and module cycles are
+// fine to the compiler: two views of one program, one `resources`
+// behind both.  build.zig supplies the module: while generating, the
+// app is compiled against src/vectors_stub.zig; what ships links the
+// generated file, src/generated/irq.zig — in the tree for anyone to
+// read, regenerated on every build.
+const vectors = @import("vectors");
+
+/// The interrupt tasks, hoisted out of the config literal so the
+/// vector generator can read the list without touching the rest of
+/// `config`: materializing the full config would materialize idle's
+/// address, and idle's body calls the very vectors the generator is
+/// writing — a cycle the build resolves by generating first.
+pub const tasks: []const rticz.ResourceTask = &.{
+    .{
+        .task_id = t0,
+        .interrupt_id = "TIMER0",
+        .priority = 1,
+        .resources = &.{ &resources.res_a, &resources.res_b },
+    },
+    .{
+        .task_id = t1,
+        .interrupt_id = "UART0",
+        .priority = 2,
+        .resources = &.{ &resources.res_b, &resources.res_c },
+    },
+};
 
 pub const config: rticz.ResourceConfig = .{
     // init and idle are tasks, so they are declared like tasks:
@@ -29,25 +65,13 @@ pub const config: rticz.ResourceConfig = .{
         .resources = &.{&resources.res_c},
     },
 
-    .tasks = &.{
-        .{
-            .task_id = t0,
-            .interrupt_id = "TIMER0",
-            .priority = 1,
-            .resources = &.{ &resources.res_a, &resources.res_b },
-        },
-        .{
-            .task_id = t1,
-            .interrupt_id = "UART0",
-            .priority = 2,
-            .resources = &.{ &resources.res_b, &resources.res_c },
-        },
-    },
+    .tasks = tasks,
 };
 
 /// Every interrupt context of the application would be a handler of
-/// this shape.  The host build keeps them as functions the idle task
-/// calls in sequence.
+/// this shape.  The host build reaches them through the generated
+/// vector functions — the same path the core takes on hardware, with
+/// idle's calls standing in for the interrupt lines firing.
 ///
 /// A handler referenced from the system definition is part of the
 /// application's visible surface: the framework resolves references by
@@ -68,14 +92,20 @@ pub fn t1() void {
     resources.res_c.set("from t1") catch {};
 }
 
-/// The priority assigned to `handler` in `config`.  The address of a
+/// The priority assigned to `handler` in the task table (which
+/// `config` embeds verbatim).  The address of a
 /// function is stable, so a handler can look itself up in the table
 /// it is declared in.  `inline` + `comptime` parameter: the lookup
 /// runs at every call site at compile time — even from the idle task's
 /// runtime code — and a handler missing from `config` is a compile
 /// error there.
+///
+/// It reads the hoisted `tasks`, not `config.tasks`: a handler's
+/// comptime self-lookup would otherwise materialize the full config,
+/// idle included, wherever only the handler is needed — such as the
+/// vector generator's pass, which runs before idle's vectors exist.
 pub inline fn priorityOf(comptime handler: rticz.Handler) u8 {
-    for (config.tasks) |task| {
+    for (tasks) |task| {
         if (task.task_id == handler) return task.priority;
     }
     @compileError("handler is not declared in config");
@@ -122,13 +152,15 @@ pub fn init() void {
 /// The idle loop: the lowest-priority context of the system (logical
 /// priority 0), running only while nothing else does.  It publishes
 /// the beat through `res_c` — the access the config declares for it —
-/// and calls the handlers in the order the simulated priorities
-/// dictate; on real hardware each call site is instead an interrupt.
+/// and enters the interrupt handlers *through their vector functions*,
+/// in the order the simulated priorities dictate; on real hardware the
+/// lines fire and the core enters those same functions from the vector
+/// table.
 pub fn idle() noreturn {
     var beat: usize = 0;
     while (true) : (beat += 1) {
-        t1();
-        t0();
+        vectors.UART0();
+        vectors.TIMER0();
 
         // Publish the beat through the resource, not around it: the
         // config says idle touches `res_c`, and here it does.

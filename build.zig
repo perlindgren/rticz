@@ -26,9 +26,14 @@ pub fn build(b: *std.Build) void {
     // table are computed *at comptime* by the compiler itself (see
     // rticz.ceiling.computeAtComptime and src/glue.zig), which is strictly
     // stronger than a codegen tool: invalid configurations are compile
-    // errors pointing at the offending source line, and there is no
-    // generated file that could drift from the config. No JSON is parsed
-    // anywhere in the compiled binary; build.zig only wires modules.
+    // errors pointing at the offending source line. No JSON is parsed
+    // anywhere in the compiled binary.
+    //
+    // The one thing the compiler genuinely cannot emit is the interrupt
+    // vector table: on real hardware a task is reached through a function
+    // whose *name* is the vector's name, and Zig has no hook to place
+    // symbols in a vector table. That single artifact is generated — see
+    // the "interrupt vectors" section below (src/extract.zig).
     // ------------------------------------------------------------------
 
     // The library: config data model, JSON parser (for the CLI), ceiling
@@ -40,15 +45,92 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    // The application root: `pub const config` plus init, idle, and the
-    // task handlers — the hand-written half.
+    // ------------------------------------------------------------------
+    // Interrupt vectors — the codegen step.
+    //
+    // On real hardware a task is reached through a function named after
+    // the vector — `TIMER0`, `UART0` — that the linker drops into the
+    // vector table.  Zig cannot place symbols in a vector table, so that
+    // one artifact is generated: `src/extract.zig` compiles the app,
+    // walks its task list, and emits one trampoline per `interrupt_id`
+    // (`pub fn TIMER0() void { app.t0(); }`) into a module the app
+    // itself imports as `vectors`.
+    //
+    // The loop — extract needs a compiled app, the app needs vectors —
+    // is broken by handing the two compilations different `vectors`
+    // modules:
+    //
+    //   * extract's copy of the app is wired against the committed
+    //     src/vectors_stub.zig: empty, and enough, because the generator
+    //     never forces idle's body to be analyzed — it reads
+    //     `app.tasks`, never `app.config`, and materializing the full
+    //     config would materialize idle's address, whose body names the
+    //     vectors and would choke on the stub.  The handlers' bodies are
+    //     vector-free; their comptime self-lookup goes through the
+    //     hoisted task list precisely so it needs nothing from the stub;
+    //   * the real vectors are written into the tree at
+    //     src/generated/irq.zig — git-ignored, but visible: the file
+    //     the build produced is there for anyone to read, not buried
+    //     in the content cache.  Two consequences of it being a plain
+    //     source path rather than a declared build-graph output: the
+    //     steps that consume it are ordered after the generator by
+    //     hand, and the generator declares no outputs, so it re-runs
+    //     on every build — delete src/generated/ and `zig build` puts
+    //     it right back.
+    //
+    // The app↔vectors module cycle is legal to the compiler: two views
+    // of one program.
+    // ------------------------------------------------------------------
+
+    // The generator's view of the app: same root, stubbed vectors.
+    const app_for_extract = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "rticz", .module = mod },
+            .{ .name = "vectors", .module = b.createModule(.{
+                .root_source_file = b.path("src/vectors_stub.zig"),
+                .target = target,
+            }) },
+        },
+        // The host-simulation idle loop sleeps via libc's nanosleep.
+        .link_libc = true,
+    });
+
+    const extract = b.addExecutable(.{
+        .name = "extract",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/extract.zig"),
+            .target = target,
+            .imports = &.{
+                .{ .name = "app", .module = app_for_extract },
+                .{ .name = "rticz", .module = mod },
+            },
+        }),
+    });
+    // The generator writes the vectors into the tree.  A run step's
+    // working directory is the build root, so the path is relative to
+    // that; with no declared output the step re-runs on every build,
+    // which is what makes the visible file self-healing.
+    const gen_vectors = b.addRunArtifact(extract);
+    gen_vectors.setName("gen-vectors");
+    gen_vectors.addArg("src/generated/irq.zig");
+
+    // The shipped view: the application root plus the real vectors
+    // module — which imports "app" to reach the handlers, a module
+    // cycle, so the pair is created first and tied together after.
     const app_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{.{ .name = "rticz", .module = mod }},
-        // The host-simulation idle loop sleeps via libc's nanosleep.
         .link_libc = true,
     });
+    const vectors_mod = b.createModule(.{
+        .root_source_file = b.path("src/generated/irq.zig"),
+        .target = target,
+    });
+    vectors_mod.addImport("app", app_mod);
+    app_mod.addImport("vectors", vectors_mod);
 
     // The main executable: the RTIC-style glue (framework half) as the root
     // module — its `main` calls app.init() and then app.idle(), which never
@@ -89,6 +171,13 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
     b.installArtifact(cli);
 
+    // src/generated/irq.zig is a plain source path, not a declared
+    // output, so the build graph does not know the generator produces
+    // it: every step that compiles the app (or the glue/test module
+    // that imports it) must wait for the generator by hand.
+    exe.step.dependOn(&gen_vectors.step);
+    cli.step.dependOn(&gen_vectors.step);
+
     // `zig build run` boots the program. Note: idle never returns,
     // so this runs until you Ctrl-C it.
     const run_step = b.step("run", "Run the app (init, then idle forever)");
@@ -127,6 +216,8 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    // Glue tests import the app, which imports the generated vectors.
+    exe_tests.step.dependOn(&gen_vectors.step);
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);

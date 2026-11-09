@@ -98,8 +98,24 @@ pub fn handlerName(comptime handlers_ns: type, comptime handler: anytype) ?[]con
     // that even to a comptime-evaluated function.
     inline for (@typeInfo(handlers_ns).@"struct".decl_names) |decl_name| {
         const name: []const u8 = decl_name;
-        if (@TypeOf(@field(handlers_ns, name)) != target) continue;
-        if (std.meta.eql(handler, &@field(handlers_ns, name))) return name;
+        // The app's contract surface — the system definition and the
+        // hoisted task list it embeds — is vocabulary, never a
+        // handler, and probing it is not merely wasted but wrong:
+        // reading a container-level const evaluates its value, and
+        // `config`'s value embeds idle's address, whose analysis
+        // names the interrupt vectors.  During the vector-generation
+        // pass the app compiles against the empty stub, and that
+        // analysis would (rightly) reject it.  Handlers are the
+        // application's *other* functions; these two names stay out
+        // of the walk.  (Shape is load-bearing: the guard must be a
+        // short-circuit operand, not an `if … continue` — comptime
+        // flow control inside a block that a runtime instantiation
+        // also sees is rejected, and this generic does get
+        // instantiated from runtime code.)
+        const is_contract = std.mem.eql(u8, name, "config") or std.mem.eql(u8, name, "tasks");
+        if (!is_contract and @TypeOf(@field(handlers_ns, name)) == target) {
+            if (std.meta.eql(handler, &@field(handlers_ns, name))) return name;
+        }
     }
     return null;
 }
