@@ -139,8 +139,20 @@ pub const config: rticz.ResourceConfig(context.idle) = .{
 /// walking the module's *public* declarations, so `t0` and `t1` are
 /// `pub` — exactly what a name-based config could name across files.
 pub fn t0(ctx: *context.t0) void {
-    ctx.res_a.claim(add_n, @as(u64, 1)); // capture: the amount to add
-    ctx.res_b.claim(bump_x, @as(u32, 1));
+    // The capture is a bare literal, on purpose.  A bare `1` is a
+    // `comptime_int`: no machine type of its own until it is used,
+    // and the use is `claim` handing it to the section's first
+    // parameter — `amount: u64` for `add_n` — where the literal
+    // takes *that* type, at comptime; a value the parameter cannot
+    // represent (negative, overflowing, a string) is a comptime error
+    // raised at `claim`'s `body(captured, ...)`.  So the section's
+    // signature owns the capture type and the call site needs no
+    // `@as` — one fewer place the same type is written, and it can
+    // never disagree with the other.  The boundary: literals bend to
+    // the parameter; a *typed* value (`const`/`var`) must already
+    // match it exactly, at any width.
+    ctx.res_a.claim(add_n, 1); // capture: the amount to add
+    ctx.res_b.claim(bump_x, 1); // the same `1`, this time as `step: u32`
     // A handler can ask its own priority — from the config table, at
     // comptime, off the function's own address.
     comptime {
@@ -149,7 +161,12 @@ pub fn t0(ctx: *context.t0) void {
 }
 
 pub fn t1(ctx: *context.t1) void {
-    ctx.res_b.claim(bump_y, @as(u32, 1));
+    ctx.res_b.claim(bump_y, 1); // `step: u32` again, literal as ever
+    // A string literal is the other case: it *has* a type — an array
+    // pointer, `*const [6:0]u8` here — and reaches `text: []const u8`
+    // by coercion, the array-to-slice one Zig allows in that
+    // direction and only it.  Bending versus coercing, two roads to
+    // the same end: `overwrite`'s signature still owns the type.
     ctx.res_c.claim(overwrite, "from t1");
 }
 
@@ -269,7 +286,11 @@ pub fn idle(ctx: *context.idle) noreturn {
 /// hands the next everything it may need, because a claimed section
 /// receives nothing else: the previous holdings, and the one
 /// reference this level borrows.  Nesting *different* resources is
-/// how accesses compose; the guards make that rule literal.
+/// how accesses compose; the guards make that rule literal.  These
+/// captures are typed literals — `WithA{...}`, not a bare `1` — the
+/// strict side of `claim`'s typing: a typed capture must match the
+/// section's first parameter exactly, while a bare literal would
+/// have bent to it (the note at `t0` holds the other side).
 const IdleEnv = struct { ctx: *context.idle, beat: usize };
 const WithA = struct { env: IdleEnv, a: u64 };
 const WithAB = struct { with_a: WithA, b: Position };
