@@ -1,124 +1,108 @@
 //! The application.  Everything lives in one file: resources as
-//! plain declarations, the task handlers, and the system definition
-//! that ties them together by reference — init, idle, and the
-//! interrupt tasks are all just functions referenced by name.
-//!
-//! `task_specs` and `config` are the single source of truth: the
-//! glue layer reads them, derives the resource ceilings and the task
-//! table from them at compile time, and prints the report in `main`.
-//! Nothing is parsed.  And even RTIC's per-task context structs are
-//! never handwritten: `codegen/gen_context.zig` reads `task_specs` and
-//! *emits* one context struct per task into
-//! `src/generated/context.zig`, imported as `context` below — a
-//! handler's signature simply names `context.t0`, and nothing
-//! else in this file mentions contexts at all.  (Named after the
-//! task — RTIC's `Context<T0>` for task `t0` — the name declared in
-//! the spec as a plain string: the generator reads the handler-free
-//! declaration precisely so that no handler needs to compile before
-//! its own context exists, and only there the name can be data.  The
-//! vector generator checks the handler is declared under that same
-//! name.)  Idle is a task too: `context.idle`, from `idle_spec`, and
-//! the glue enters idle with the generated `makeIdleCtx`.
+//! plain declarations, the task handlers, and ONE `config` — the
+//! system definition that is the file's only statement of what the
+//! system is.  init and idle are referenced functions; each
+//! interrupt task is a row that *names* its handler — RTIC's rule
+//! that a task and its handler share one name — beside its interrupt
+//! line, priority, and resource accesses.  The glue reads `config`,
+//! derives the resource ceilings and the task table from it at
+//! compile time, and prints the report in `main`.  Nothing is parsed.
+//! And even RTIC's per-task context structs are never handwritten:
+//! the code generator reads `config` and *emits* one context struct
+//! per task into `src/generated/context.zig`, imported as `context`
+//! below — a handler's signature simply names `context.t0`, and
+//! nothing else in this file mentions contexts at all.  (Named after
+//! the task — RTIC's `Context<T0>` for task `t0`.  The generator
+//! reads this file as *text*, with `std.zig.Ast` — the same parser
+//! the compiler uses — so it understands the config, function
+//! references and all, without compiling anything: to a reader of
+//! text a reference is a name, and names are checked against the
+//! declarations of this file.  Real RTIC does the same thing with
+//! its `#[app]` macro.  This application is then compiled exactly
+//! once, against the real generated files — the place where every
+//! promise finally meets its types.)  Idle is a task too:
+//! `context.idle`, from its config row, and the glue enters idle
+//! with the generated `makeIdleCtx`.
 //!
 //! Two modules are generated, both from what you see below, both in
 //! src/generated/ — visible, regenerated every build:
 //!
 //! *   `context.zig` — the per-task context structs, from
-//!     `task_specs` (codegen/gen_context.zig);
+//!     `config` (codegen/generate.zig);
 //! *   `irq.zig` — one trampoline per `interrupt_id`, which builds
-//!     the context struct and calls its handler (codegen/extract.zig);
-//!     on hardware these names are the vector-table symbols.
+//!     the context struct and calls its handler, plus the generated
+//!     handler-binding table `tasks` that `priorityOf` reads; on
+//!     hardware the trampoline names are the vector-table symbols.
 //!
 //! Handlers are plain file-scope functions taking their context, so
 //! a handler may as well come from another file —
 //! `const t0 = @import("irq.zig").t0;` — an imported alias is just
-//! as addressable.
+//! as nameable.
 
 const std = @import("std");
 const rticz = @import("rticz");
 
-// The per-task contexts: a module emitted by codegen/gen_context.zig
-// from `task_specs` below, during the build.  The import is a
-// deliberate cycle — the contexts import "app" to reach the resource
-// declarations they point into, and the app imports "context" to
-// name them — and module cycles are fine to the compiler: two views
-// of one program.
+// The per-task contexts: a module emitted by codegen/generate.zig
+// from `config` below, before this file is ever compiled.  The
+// import is a deliberate cycle — the contexts import "app" to reach
+// the resource declarations they point into, and the app imports
+// "context" to name them — and module cycles are fine to the
+// compiler: two views of one program.
 const context = @import("context");
 
-// The interrupt vector table: a module emitted by codegen/extract.zig
-// from the task list below, during the build.  The same deliberate
+// The interrupt vector table: the other module emitted by
+// codegen/generate.zig from `config` below.  The same deliberate
 // cycle: the vectors import "app" to reach the handlers, and the app
-// imports "vectors" to call them.  build.zig supplies both modules:
-// while generating, the app is compiled against the committed stubs
-// codegen/context_stub.zig and codegen/vectors_stub.zig; what ships links
-// the generated files, src/generated/context.zig and
-// src/generated/irq.zig — in the tree for anyone to read,
-// regenerated on every build.
+// imports "vectors" to call them.  Both generated files live at
+// src/generated/context.zig and src/generated/irq.zig — in the tree
+// for anyone to read, regenerated on every build.
 const vectors = @import("vectors");
 
-/// The task declarations, handler-free by design: the task's name,
-/// its interrupt line, its priority, and the resources the task
-/// accesses — each access a name-`&`-the-instance pair, so the
-/// *declaration* is where names are claimed, for the analysis, the
-/// generated contexts, and the generated trampolines alike.  The
-/// task's name doubles as its context's name (`context.t0`), RTIC's
-/// convention; it is spelled here as a string because the generators
-/// read only this list (never `config`): no handler must compile
-/// before the context its signature names exists, and reading a
-/// handler-free list forces no handler's analysis — a declared
-/// function's name could not be read here without dragging its
-/// signature along.
-pub const task_specs = [_]rticz.resource.TaskSpec{
-    .{
-        .name = "t0",
-        .interrupt_id = "TIMER0",
-        .priority = 1,
-        .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b }),
-    },
-    .{
-        .name = "t1",
-        .interrupt_id = "UART0",
-        .priority = 2,
-        .resources = rticz.resource.refs(.{ .res_b = &res_b, .res_c = &res_c }),
-    },
-};
-
-/// Idle's declaration, handler-free like `task_specs` — it is the
-/// context generator's input for `context.idle`, so no function
-/// reference may ride along.  What idle touches: the beat is
-/// published *through* the resources, so all three are access
-/// declarations, read and written only inside claimed sections below.
-pub const idle_spec = rticz.resource.IdleSpec{
-    .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b, .res_c = &res_c }),
-};
-
-/// The interrupt tasks: the specs above, each bound to the handler
-/// that answers its interrupt, in order.  Hoisted out of the config
-/// literal so the vector generator can read the list without
-/// touching the rest of `config`: materializing the full config
-/// would materialize idle's address, and idle's body calls the very
-/// vectors the generator is writing — a cycle the build resolves by
-/// generating first.  A handler paired with the wrong spec cannot
-/// hide: the generated trampoline builds the spec's context literal,
-/// which must type-check against the handler's own signature.
-pub const tasks: []const rticz.ResourceTask = &rticz.resource.bindHandlers(.{ t0, t1 }, &task_specs);
-
-pub const config: rticz.ResourceConfig(context.idle) = .{
-    // init and idle are tasks, so they are declared like tasks:
-    // references to functions, no invented names.  init runs before
-    // interrupts are enabled — nothing races it, so it declares no
-    // resource list.  idle is the lowest-priority context: logical
-    // priority 0 comes from being idle, not from a declaration, so it
-    // states only what is a choice — the resources it touches — and
-    // it states them once, in `idle_spec`, the generator's input for
-    // the very `context.idle` this config's type names.
+/// The system definition, one section: what the application is, in
+/// one literal.  The generators and the glue all read *this* —
+/// ceilings, contexts, vectors, banner — so there is nothing else to
+/// keep in sync.  An interrupt task row names its handler (the name
+/// is the reference: RTIC's rule, checked by the code generator
+/// against this file's declarations, and turned into the generated
+/// trampoline's typed call) and lists its resources as name-`&`-the-
+/// instance pairs, so the *declaration* is where names are claimed,
+/// for the analysis, the generated contexts, and the generated
+/// trampolines alike.
+///
+/// init and idle, by contrast, are references, not names: an app may
+/// hold any number of `fn () void`s, and only a reference says which.
+/// They are the config's two function references — possible because
+/// the generator reads this literal as text: a reference is a name
+/// token, checked against the functions this file declares, and no
+/// body is ever compiled before the real contexts and vectors
+/// exist.  (The glue, in the final compile, resolves each reference
+/// back to the name it refers to, for the banner and the tables.)
+/// Idle is the lowest-priority context: logical priority 0 comes
+/// from being idle, not from a declaration, so it states only what
+/// is a choice — the resources it touches — and the code generator
+/// emits `context.idle` from that same row.
+pub const config: rticz.Config(context.idle) = .{
     .init = init,
     .idle = .{
         .task_id = idle,
-        .resources = idle_spec.resources,
+        .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b, .res_c = &res_c }),
     },
-
-    .tasks = tasks,
+    // `&.{ … }`: the field is a slice, so the rows live in a constant
+    // array the slice points into — Zig needs to know where they are.
+    .tasks = &.{
+        .{
+            .name = "t0",
+            .interrupt_id = "TIMER0",
+            .priority = 1,
+            .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b }),
+        },
+        .{
+            .name = "t1",
+            .interrupt_id = "UART0",
+            .priority = 2,
+            .resources = rticz.resource.refs(.{ .res_b = &res_b, .res_c = &res_c }),
+        },
+    },
 };
 
 /// The interrupt tasks arrive with their context: a pointer to a
@@ -188,24 +172,27 @@ fn overwrite(text: []const u8, label: *Label) void {
     label.set(text) catch {};
 }
 
-/// The priority assigned to `handler` in the task table (which
-/// `config` embeds verbatim).  The address of a
-/// function is stable, so a handler can look itself up in the table
-/// it is declared in.  `inline` + `comptime` parameter: the lookup
-/// runs at every call site at compile time — even from the idle task's
-/// runtime code — and a handler missing from `config` is a compile
-/// error there.
+/// The priority assigned to `handler` in the task table.  The address
+/// of a function is stable, so a handler can look itself up in the
+/// table it is declared in.  `inline` + `comptime` parameter: the
+/// lookup runs at every call site at compile time — even from the
+/// idle task's runtime code — and a handler missing from `config` is
+/// a compile error there.
 ///
-/// It reads the hoisted `tasks`, not `config.tasks`: a handler's
-/// comptime self-lookup would otherwise materialize the full config,
-/// idle included, wherever only the handler is needed — such as the
-/// generator passes, which run before the things idle names exist.
+/// It reads the generated binding table `vectors.tasks` — the table
+/// `codegen/generate.zig` emits from the config rows and the
+/// functions their names name, where both sides of the pairing are
+/// visible.  The lookup keys on handler
+/// *addresses*, which the config's rows deliberately do not carry;
+/// the table lives in `vectors` because it is the vector generator
+/// that sees both sides of the pairing — the name in the row, the
+/// function in the namespace.
 pub inline fn priorityOf(comptime handler: anytype) u8 {
     // Pointer identity, not `@intFromPtr`: a function's address is a
     // link-time fact, but identity is a comptime question — and the
     // erased `task_id` in the table gives the common shape.
     const self: *const anyopaque = handler;
-    for (tasks) |task| {
+    for (vectors.tasks) |task| {
         if (std.meta.eql(self, task.task_id)) return task.priority;
     }
     @compileError("handler is not declared in config");

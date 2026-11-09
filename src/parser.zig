@@ -42,12 +42,12 @@ pub const Task = struct {
     resources: []const []const u8,
 };
 
-/// A name-based task table: what the JSON frontends parse into, and what
-/// `resource.namedTasks` resolves the application's address-based config
+/// A name-based task table: what the JSON frontends parse into, and
+/// what `resource.namedTasks` reshapes the application's config rows
 /// into. This is the shape the ceiling analysis operates on, e.g.
 ///
 /// ```zig
-/// const analysis: rticz.Config = .{
+/// const analysis: rticz.parser.Config = .{
 ///     .tasks = &.{
 ///         .{ .task_id = "t0", .interrupt_id = "TIMER0", .priority = 1,
 ///            .resources = &.{"res_a"} },
@@ -226,10 +226,8 @@ test "comptimeValidate accepts a well-formed compile-time config" {
     // The failure paths are @compileError — they cannot be caught by a test,
     // but they are exercised by the build itself (see src/root.zig).
     comptimeValidate(&.{
-        .{ .task_id = "t0", .interrupt_id = "TIMER0", .priority = 1,
-           .resources = &.{ "res_a", "res_b" } },
-        .{ .task_id = "t1", .interrupt_id = "TIMER1", .priority = 2,
-           .resources = &.{"res_c"} },
+        .{ .task_id = "t0", .interrupt_id = "TIMER0", .priority = 1, .resources = &.{ "res_a", "res_b" } },
+        .{ .task_id = "t1", .interrupt_id = "TIMER1", .priority = 2, .resources = &.{"res_c"} },
     });
     try testing.expect(isZigIdentifier("t0"));
     try testing.expect(!isZigIdentifier("0t"));

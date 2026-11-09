@@ -1,35 +1,38 @@
 //! The typed application side: resources as real Zig declarations and
 //! tasks referenced by their handler functions.
 //!
-//! The application writes its system definition in `src/root.zig`:
-//! each resource is its own `pub var` — placeable in its own linker
-//! section or alignment — and `task_specs` declares each interrupt
-//! task's line, priority and resource accesses, while `config` names
-//! the entry points by reference:
+//! The application writes its system definition in `src/root.zig` as
+//! one `config`: each resource is its own `pub var` — placeable in its
+//! own linker section or alignment — each interrupt task is a row
+//! naming its handler, its line, its priority and its resource
+//! accesses, and the entry points are named by reference:
 //!
 //! ```zig
 //! pub var res_a: u64 = 0;
 //!
-//! const task_specs = [_]rticz.resource.TaskSpec{
-//!     .{ .name = "t0", .interrupt_id = "TIMER0", .priority = 1,
-//!        .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b }) },
+//! pub const config: rticz.Config(context.idle) = .{
+//!     .init = init,
+//!     .idle = .{ .task_id = idle, .resources = … },
+//!     .tasks = .{
+//!         .{ .name = "t0", .interrupt_id = "TIMER0", .priority = 1,
+//!            .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b }) },
+//!     },
 //! };
-//!
-//! .tasks = &rticz.resource.bindHandlers(.{ t0, t1 }, &task_specs),
 //! ```
 //!
 //! A resource access is a *named pair* (`ResourceRef`): the name and
 //! `&` of the same declaration, written together as one literal, so
 //! no analysis ever recovers a name by walking a namespace or
 //! comparing addresses — the name is written down exactly where it is
-//! claimed.  init and idle are tasks, so they are declared the same
-//! way as the interrupt tasks: a reference to the function, no
-//! invented name.  The glue layer resolves each function pointer back
-//! to its declared name by walking the application namespace and
-//! comparing addresses (`std.meta.eql` compares pointers to declared
-//! items at comptime), so the JSON analysis front end keeps seeing
-//! plain names, and the boot banner can print what the program is
-//! made of.
+//! claimed.  An interrupt task's `name` doubles as its handler's
+//! declared name (RTIC's rule, checked at the build), so the tasks
+//! need no function reference at all; init and idle do have one,
+//! because an app may hold any number of `fn () void`s and only a
+//! reference says which — the glue resolves each back to its declared
+//! name by walking the application namespace and comparing addresses
+//! (`std.meta.eql` compares pointers to declared items at comptime),
+//! so the JSON analysis front end keeps seeing plain names, and the
+//! boot banner can print what the program is made of.
 //!
 //! Two Zig facts shape the implementation.  A `var` in the namespace
 //! cannot be read at comptime, so the handler walk asks only
@@ -45,8 +48,8 @@
 //! plain struct named after the *task* — `context.t0`, not
 //! `context.TIMER0`, exactly as RTIC hands `Context<T0>` to the task
 //! that binds an interrupt — generated into
-//! `src/generated/context.zig` by `codegen/gen_context.zig` from the
-//! very `task_specs` declared here: one struct per declared name,
+//! `src/generated/context.zig` by `codegen/generate.zig` from the
+//! very `config` declared here: one struct per declared name,
 //! fields one per accessed resource, a `Claim(name, T, ceiling)`
 //! proxy over the application's declaration — the resource's name
 //! and priority ceiling baked into the field type, the ceiling the
@@ -54,20 +57,23 @@
 //! (see `Claim` below): the handler reaches the data only inside a
 //! `claim`ed critical section, under the mask that ceiling stands
 //! for.  The name lives
-//! in the spec as a plain string because the generator reads the
-//! handler-free declaration, and a task's name is only visible there
-//! as data — the vector generator, which does see the handlers,
-//! checks the declared name against the handler's own.  Idle gets a
-//! context too (`context.idle`, built from an `IdleSpec`), the one
+//! in the config as a plain string because the generator reads the
+//! config from the application's *text* (codegen/appsrc.zig, on
+//! `std.zig.Ast`), where a row naming its handler is a name token —
+//! and the reader checks that the name really names a public
+//! function of the same file.  Idle gets
+//! a context too (`context.idle`, built from its config row), the one
 //! activation being the runtime loop itself, whose context the glue
 //! constructs once with the generated `makeIdleCtx`.
 //!
-//! Handlers therefore do not share a signature, which is why a task's
-//! `task_id` reference is an erased address: the config needs
-//! identity, and the generated trampoline's call is what checks the
-//! signature.  Idle is the exception that proves the point: the glue
-//! *calls* idle, so `IdleTask` is generic over its context type and
-//! keeps the reference typed.
+//! Handlers share no signature, so a handler reference, where one
+//! exists at all, is an erased address: identity is what the system
+//! needs, and the generated trampoline's call is what checks the
+//! signature.  Only the *generated* binding table holds such
+//! addresses; the config itself needs none for the interrupt tasks,
+//! whose name *is* the reference.  Idle is the exception that proves
+//! the point: the glue *calls* idle, so `IdleTask` is generic over
+//! its context type and keeps the reference typed.
 
 const std = @import("std");
 
@@ -81,10 +87,10 @@ pub const Handler = *const fn () void;
 /// is that declaration's own storage.  `refs` produces these from
 /// the anonymous-struct literal an application writes; the analysis,
 /// the generated context structs, and the generated trampolines all
-/// read names straight from here — no reflection back through the
-/// application namespace, which comptime cannot do safely (a
-/// namespace holds consts whose evaluation would force handler
-/// analysis, exactly what the build's stub passes must not trigger).
+/// read names straight from here — the names must be *data* because
+/// they cross the boundary between the generator, which reads the
+/// application as text, and the compiler, which alone can reflect
+/// into its namespace.
 pub const ResourceRef = struct {
     name: []const u8,
     ptr: *anyopaque,
@@ -125,24 +131,17 @@ pub fn refs(comptime named: anytype) []const ResourceRef {
     return &frozen.items;
 }
 
-/// What one interrupt task declares, before any handler is attached:
-/// its name, its interrupt line, its priority, and the resources it
-/// accesses.  The application writes a list of these; it is the input
-/// the context generator reads.  It deliberately contains no function
-/// references: reading it must not force the analysis of any handler,
-/// because the generator that produces the handler contexts has to
-/// read the declaration *before* those handlers can compile — a
-/// handler's signature is going to *name* one of the very contexts
-/// the generator emits.
-///
-/// `name` is the task's name — RTIC names each task's context after
-/// the task, so this string names the emitted context struct — and it
-/// is a string for the same reason the whole list is function-free:
-/// the handler's *declared* name is only visible by analyzing the
-/// handler, which is exactly what this pass must not do.  The vector
-/// generator, which does analyze handlers, checks that the handler is
-/// declared under this name; the handler's signature, which names
-/// `context.<name>`, closes the loop.
+/// What one interrupt task declares in the config: its name, its
+/// interrupt line, its priority, and the resources it accesses.  This
+/// is what the generator reads from the application's text and
+/// trampolines from.  It carries no function reference: the handler
+/// is *named*, and RTIC's rule makes the name three names at once —
+/// it names the emitted context struct (`context.t0`), it names the
+/// handler (`pub fn t0`), and the generator enforces that the
+/// application declares exactly this function.  A name, not a
+/// reference, is what survives the crossing: the config is written
+/// once, read as text by the generator and as Zig by the compiler,
+/// and a name means the same thing on both sides.
 pub const TaskSpec = struct {
     name: []const u8,
     interrupt_id: []const u8,
@@ -150,55 +149,20 @@ pub const TaskSpec = struct {
     resources: []const ResourceRef,
 };
 
-/// The complete declaration of one interrupt task: its spec (from the
-/// application's `task_specs`) and the handler that answers its
-/// interrupt.  The handler is held as an erased address because each
-/// handler takes its own context struct and therefore shares no
-/// signature; identity is what the system needs from the reference,
-/// and the generated trampoline's call checks the signature.
+/// A task with its handler attached: the spec plus the erased address
+/// of the function its name names.  The application never writes
+/// these — `codegen/generate.zig` *emits* the table (as `pub const
+/// tasks` in the generated vectors) from the config rows and the
+/// functions their names name.  The address is erased because
+/// handlers take
+/// per-task contexts and share no signature; identity is what
+/// `priorityOf` looks up, and the trampoline's own call is what types
+/// the handler against its context.
 pub const Task = struct {
     task_id: *const anyopaque,
     name: []const u8,
     interrupt_id: []const u8,
     priority: u8,
-    resources: []const ResourceRef,
-};
-
-/// Attach handlers to specs, in order: entry `i` of `handlers`
-/// answers interrupt `i` of `specs`.  The application's `pub const
-/// tasks` is this one line, which is what keeps the two views of a
-/// task — the declaration the generator reads, the executable entry
-/// the analysis walks — from ever disagreeing.  A handler paired with
-/// the wrong spec fails at the trampoline: the context literal built
-/// from the spec's resources would not fit the context type the
-/// handler's signature demands, and the vector generator checks the
-/// handler's declared name against the spec's.
-pub fn bindHandlers(comptime handlers: anytype, comptime specs: []const TaskSpec) [specs.len]Task {
-    const names = @typeInfo(@TypeOf(handlers)).@"struct".field_names;
-    if (names.len != specs.len) {
-        @compileError("bindHandlers: the handler list and the task spec list have different lengths");
-    }
-    var out: [specs.len]Task = undefined;
-    inline for (names, specs, 0..) |handler_name, spec, i| {
-        out[i] = .{
-            .task_id = @field(handlers, handler_name),
-            .name = spec.name,
-            .interrupt_id = spec.interrupt_id,
-            .priority = spec.priority,
-            .resources = spec.resources,
-        };
-    }
-    return out;
-}
-
-/// What the idle task declares, before its handler is attached: the
-/// resources it accesses.  Like `TaskSpec` this is pure data — no
-/// function reference — because it is the context generator's input
-/// for the idle context, `context.idle`, exactly as `task_specs` is
-/// the input for the interrupt tasks' contexts.  The name is not a
-/// choice: there is one idle, and the context is `context.idle`, so
-/// nothing else needs stating.
-pub const IdleSpec = struct {
     resources: []const ResourceRef,
 };
 
@@ -223,17 +187,20 @@ pub fn IdleTask(comptime IdleCtx: type) type {
     };
 }
 
-/// The system definition: entry points and interrupt tasks, all as
-/// function references.  init and idle are tasks like the rest; only
-/// the runtime treats them specially (init runs before interrupts are
-/// enabled, idle runs when nothing else does).  Generic over the
-/// idle context type — see `IdleTask`; the application spells it
-/// `rticz.ResourceConfig(context.idle)`.
+/// The system definition, one section: the entry points and the
+/// interrupt tasks, all of it the application's only declaration of
+/// what the system is.  init and idle are referenced functions — the
+/// config *has* their addresses, so their names are recovered by the
+/// glue's namespace walk, and the generator sees them as the names
+/// they are, text being reference-blind; the interrupt tasks name
+/// their handler instead, every name checked against the functions
+/// this same file declares.  Generic over the idle context type — see
+/// `IdleTask`; the application spells it `rticz.Config(context.idle)`.
 pub fn Config(comptime IdleCtx: type) type {
     return struct {
         init: Handler,
         idle: IdleTask(IdleCtx),
-        tasks: []const Task,
+        tasks: []const TaskSpec,
     };
 }
 
@@ -279,13 +246,57 @@ pub fn Config(comptime IdleCtx: type) type {
 /// section, `-- priority ceiling res_a restored` after — and only if
 /// the section really returns, because one that never does leaves the
 /// mask raised, and the trace saying so is the point of printing it.
+///
+/// ## What this does not prevent
+///
+/// The guard is a runtime echo of the borrow check, not the borrow
+/// check.  Zig has no type-based alias analysis, no private struct
+/// fields, and no lifetimes, so an application that wants to reach a
+/// resource raw can do it three ways, and no arrangement of types
+/// stops any of them:
+///
+///   1. Write the declaration directly.  Handlers live in the same
+///      file as the resources they touch; `res_a += 1` inside a
+///      handler never sees this proxy at all.  Same-file visibility
+///      cannot be hidden from — `pub` is enforced across files, not
+///      within one.
+///   2. Read through the proxy: `ctx.res_a.ptr.*` is nine characters
+///      to raw memory, because `ptr` is an ordinary struct field and
+///      Zig has no private fields.
+///   3. Stash the `*T` the claim lends and use it after the section
+///      ends.  The retraction is ceremony; making references expire
+///      needs a borrow checker — the real foundation of Rust RTIC,
+///      and the reason its locks are compile-time facts.
+///
+/// Two rules follow for everything this project generates:
+///
+///   * Never emit `noalias`.  With no type-based alias analysis to
+///     contradict it (verified: the app's ReleaseFast IR carries zero
+///     `!tbaa` annotations), an honest-sounding `noalias` on anything
+///     user code reaches lets the optimizer assume away the very
+///     sharing the guard exists to catch.
+///   * Never use `unreachable` to mean "the application should not do
+///     this".  ReleaseFast deletes `unreachable` guards entirely —
+///     probed: the double-claim check vanished, 2 raises, 0 restores,
+///     segfault.  App misbehavior must meet `@panic` or
+///     `@compileError`, which survive every optimization mode.
+///
+/// Enforcement tiers — a source lint in the generator, moving storage
+/// behind an import the application cannot wire, a checked wrapper in
+/// place of the lent `*T` — were considered and deliberately deferred
+/// (the second also waits for the library split, where resources
+/// declared inside the config become natural).  For now the honest
+/// answer is the one above: the protocol is traced and guarded
+/// against accidents, and enforced against nothing else.
 pub fn Claim(comptime name: []const u8, comptime T: type, comptime ceiling: u8) type {
     return struct {
         const Self = @This();
 
         /// The instance this proxy stands for — the application's own
         /// declaration, pointed at by the generated trampoline that
-        /// built the context.  Reachable only through `claim`.
+        /// built the context.  Reached through `claim` by everything
+        /// that behaves; nothing but convention keeps a field read
+        /// away (see *What this does not prevent*).
         ptr: *T,
         claimed: bool = false,
 
@@ -337,57 +348,47 @@ pub fn handlerName(comptime handlers_ns: type, comptime handler: anytype) ?[]con
     // that even to a comptime-evaluated function.
     inline for (@typeInfo(handlers_ns).@"struct".decl_names) |decl_name| {
         const name: []const u8 = decl_name;
-        // The app's contract surface — the system definition, the
-        // hoisted task list it embeds, and the specs the task list is
-        // bound from — is vocabulary, never a handler, and probing it
-        // is not merely wasted but wrong: reading a container-level
-        // const evaluates its value, and `config`'s value embeds
-        // idle's address, whose analysis names the interrupt vectors
-        // and the generated contexts.  During the generator passes
-        // the app compiles against the stubs, and that analysis would
-        // (rightly) reject them.  Handlers are the application's
-        // *other* functions; these names stay out of the walk.
+        // The app's contract surface — the single system definition —
+        // is vocabulary, never a handler, and probing it is not merely
+        // wasted but wrong: `@field` on a container-level const
+        // evaluates it, and `config`'s value is the whole system
+        // definition — the last thing a walk looking for *handlers*
+        // should mistake for one.  Handlers are the application's
+        // *other* functions; this name stays out of the walk.
         // (Shape is load-bearing: the guards must be short-circuit
         // operands, not `if … continue` — comptime flow control
         // inside a block that a runtime instantiation also sees is
         // rejected, and this generic does get instantiated from
         // runtime code.)
-        const is_contract = std.mem.eql(u8, name, "config") or
-            std.mem.eql(u8, name, "tasks") or
-            std.mem.eql(u8, name, "task_specs");
+        const is_contract = std.mem.eql(u8, name, "config");
         if (!is_contract and @typeInfo(@TypeOf(@field(handlers_ns, name))) == .@"fn" and
             std.meta.eql(target, @as(*const anyopaque, &@field(handlers_ns, name)))) return name;
     }
     return null;
 }
 
-/// The analysis-facing task list of an application: the same tasks as
-/// `tasks`, with the handler function pointers resolved to their
-/// declared names — resource references carry their names directly,
-/// so nothing else needs resolving — followed by the idle task, which
-/// is a task too (logical priority 0, the system's floor; it has no
-/// interrupt, so its row reads `none`).  The ceiling analysis
-/// deliberately skips that last row: idle sits at the bottom of the
-/// scale and is preempted by every interrupt task, so its 0 can never
-/// be a ceiling.  But the row records what idle-context code touches
-/// — which is exactly where a ceiling will later have to be enforced.
+/// The analysis-facing task list of an application: the config's
+/// interrupt-task rows, then the idle row — idle is a task too
+/// (logical priority 0, the system's floor; it has no interrupt, so
+/// its row reads `none`).  Nothing is resolved here: interrupt tasks
+/// *name* their handler, so the declared name is already written in
+/// the row, and resource references carry their names; `idle_name`
+/// arrives resolved because idle, uniquely, is referenced by address
+/// (its resolution is the caller's, where the namespace is visible
+/// from outside).  The ceiling analysis deliberately skips the last
+/// row: idle sits at the bottom of the scale and is preempted by every
+/// interrupt task, so its 0 can never be a ceiling.  But the row
+/// records what idle-context code touches — which is exactly where a
+/// ceiling will later have to be enforced.
 ///
-/// `handlers_ns` is the application namespace where the handlers are
-/// declared or imported; the analysis walks the application from the
-/// outside — the analysis results cannot live in root itself (a
-/// `const` in root that reads root's declarations via `@field` is a
-/// self-dependency).  Resource names need no namespace at all: each
-/// reference states its own name.
-///
-/// The whole thing runs at comptime, so a handler that is not a
-/// function of the namespace, or a priority that claims idle's 0,
-/// stops the build with an error that quotes the task by name.
+/// The whole thing runs at comptime, so a priority that claims idle's
+/// 0 stops the build with an error that quotes the task by name.
 pub fn namedTasks(
-    comptime tasks: []const Task,
-    comptime idle: anytype,
-    comptime handlers_ns: type,
+    comptime specs: []const TaskSpec,
+    comptime idle_name: []const u8,
+    comptime idle_resources: []const ResourceRef,
 ) []const parser.Task {
-    const count = tasks.len + 1;
+    const count = specs.len + 1;
 
     // One uniform view for both passes: the interrupt tasks, then
     // idle — the only differences being idle's missing interrupt and
@@ -400,33 +401,26 @@ pub fn namedTasks(
     };
     var entries: [count]Entry = undefined;
 
-    // Resolve every handler to its declared name first: the name is
-    // what error messages about the same task quote.
-    for (tasks, 0..) |task, ti| {
+    // The name is already the row's own — what error messages about a
+    // task quote is what the config wrote.
+    for (specs, 0..) |task, ti| {
         if (task.priority == 0) {
             @compileError("interrupt tasks start at priority 1; priority 0 is idle");
         }
         entries[ti] = .{
-            .name = handlerName(handlers_ns, task.task_id) orelse {
-                @compileError("the application config references a task handler that is not a " ++
-                    "`pub fn <name>` declared in the application namespace (or an alias of one)");
-            },
+            .name = task.name,
             .interrupt_id = task.interrupt_id,
             .priority = task.priority,
             .resources = task.resources,
         };
     }
     entries[count - 1] = .{
-        .name = handlerName(handlers_ns, idle.task_id) orelse {
-            @compileError("the application config references an idle handler that is not a " ++
-                "`pub fn <name>(ctx) noreturn` declared in the application namespace " ++
-                "(or an alias of one)");
-        },
+        .name = idle_name,
         .interrupt_id = "none",
         // The floor of the system, fixed here: idle declares no
         // priority because there is nothing to choose.
         .priority = 0,
-        .resources = idle.resources,
+        .resources = idle_resources,
     };
 
     // Collect every resource name into one pool.  Slices that escape
@@ -510,7 +504,7 @@ test "the system definition references init and idle by function too" {
     const system: Config(TestIdleCtx) = .{
         .init = TestTasks.alpha,
         .idle = .{ .task_id = TestTasks.forever, .resources = &.{} },
-        .tasks = &.{.{ .task_id = TestTasks.beta, .name = "beta", .interrupt_id = "X", .priority = 1, .resources = &.{} }},
+        .tasks = &.{.{ .name = "beta", .interrupt_id = "X", .priority = 1, .resources = &.{} }},
     };
     try std.testing.expectEqualStrings("alpha", handlerName(TestTasks, system.init).?);
     try std.testing.expectEqualStrings("forever", handlerName(TestTasks, system.idle.task_id).?);
@@ -520,7 +514,7 @@ test "a named access pair carries its own name and reaches its own storage" {
     // `comptime`: refs' whole design — names from reflection, a slice
     // frozen into constant memory — only exists in a comptime
     // evaluation, and an application uses it in exactly one place:
-    // the `task_specs` table, a container-level const.
+    // a config row's `resources` field, a container-level const.
     const claimed = comptime refs(.{ .counter1 = &App.counter1, .flag = &App.flag });
     try std.testing.expectEqual(@as(usize, 2), claimed.len);
     try std.testing.expectEqualStrings("counter1", claimed[0].name);
@@ -532,29 +526,9 @@ test "a named access pair carries its own name and reaches its own storage" {
     try std.testing.expectEqual(@as(u64, 3), App.counter1);
 }
 
-test "bindHandlers attaches handlers to specs, in order" {
-    comptime {
-        const specs = [_]TaskSpec{
-            .{ .name = "alpha", .interrupt_id = "X", .priority = 1, .resources = refs(.{ .counter1 = &App.counter1 }) },
-            .{ .name = "beta", .interrupt_id = "Y", .priority = 2, .resources = refs(.{ .counter2 = &App.counter2 }) },
-        };
-        const bound = bindHandlers(.{ TestTasks.alpha, TestTasks.beta }, &specs);
-        try std.testing.expectEqual(@as(usize, 2), bound.len);
-        try std.testing.expectEqualStrings("alpha", bound[0].name);
-        try std.testing.expectEqualStrings("X", bound[0].interrupt_id);
-        try std.testing.expectEqual(@as(u8, 2), bound[1].priority);
-        try std.testing.expectEqualStrings("counter2", bound[1].resources[0].name);
-        // Identity survives erasure: the reference still *is* the handler.
-        try std.testing.expectEqualStrings("alpha", handlerName(TestTasks, bound[0].task_id).?);
-        try std.testing.expectEqualStrings("beta", handlerName(TestTasks, bound[1].task_id).?);
-    }
-}
-
 // The resolution runs at comptime — the escape of `&built.tasks` and
 // the error paths only exist in a comptime evaluation — so these
 // tests force one with `comptime { ... }`.
-
-const no_idle: IdleTask(TestIdleCtx) = .{ .task_id = TestTasks.forever, .resources = &.{} };
 
 test "references name the storage instance, not the type" {
     comptime {
@@ -572,8 +546,7 @@ test "references name the storage instance, not the type" {
                 .resources = refs(.{ .counter2 = &App.counter2 }),
             },
         };
-        const tasks: []const Task = &bindHandlers(.{ TestTasks.alpha, TestTasks.beta }, &specs);
-        const named = namedTasks(tasks, no_idle, TestTasks);
+        const named = namedTasks(&specs, "forever", &.{});
 
         try std.testing.expectEqualStrings("alpha", named[0].task_id);
         try std.testing.expectEqualStrings("X", named[0].interrupt_id);
@@ -642,12 +615,7 @@ test "idle is a task in the resolved table, at logical priority 0" {
             .priority = 1,
             .resources = &.{},
         }};
-        const tasks: []const Task = &bindHandlers(.{TestTasks.alpha}, &specs);
-        const idle: IdleTask(TestIdleCtx) = .{
-            .task_id = TestTasks.forever,
-            .resources = refs(.{ .counter1 = &App.counter1 }),
-        };
-        const named = namedTasks(tasks, idle, TestTasks);
+        const named = namedTasks(&specs, "forever", refs(.{ .counter1 = &App.counter1 }));
 
         try std.testing.expectEqual(@as(usize, 2), named.len); // the task, plus idle
         const row = named[named.len - 1];
@@ -664,8 +632,7 @@ test "resolved names feed the ceiling analysis unchanged" {
             .{ .name = "alpha", .interrupt_id = "X", .priority = 1, .resources = refs(.{ .counter1 = &App.counter1 }) },
             .{ .name = "beta", .interrupt_id = "Y", .priority = 2, .resources = refs(.{ .counter1 = &App.counter1 }) },
         };
-        const tasks: []const Task = &bindHandlers(.{ TestTasks.alpha, TestTasks.beta }, &specs);
-        const named = namedTasks(tasks, no_idle, TestTasks);
+        const named = namedTasks(&specs, "forever", &.{});
         const ceilings = @import("ceiling.zig").computeAtComptime(named);
         try std.testing.expectEqual(@as(usize, 1), ceilings.len);
         try std.testing.expectEqualStrings("counter1", ceilings[0].name);

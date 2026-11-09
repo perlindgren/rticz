@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
     // reached through a function whose *name* is the vector's name,
     // and Zig has no hook to place symbols in a vector table.  Both
     // artifacts are generated — see the codegen section below
-    // (codegen/gen_context.zig, codegen/extract.zig).
+    // (codegen/generate.zig).
     // ------------------------------------------------------------------
 
     // The library: config data model, JSON parser (for the CLI), ceiling
@@ -59,131 +59,62 @@ pub fn build(b: *std.Build) void {
     //     task, named after it (`context.t0`, RTIC's `Context<T0>`),
     //     plus `context.idle` and the `makeIdleCtx` constructor the
     //     glue uses to enter idle.  A handler's signature names its
-    //     context, so no handler can compile before the contexts
-    //     exist: the context generator must read a handler-free view
-    //     of the app — `pub const task_specs` (task names, interrupt
-    //     lines, priorities, named resource accesses; no function
-    //     references in it, so reading it forces no handler analysis)
-    //     and `pub const idle_spec`.  `codegen/gen_context.zig` emits
-    //     the structs, typed `*@TypeOf(app.res_x)` over the
-    //     application's own resource declarations.
+    //     context, so the contexts must exist before handlers
+    //     compile.
     //   * `irq.zig` — one trampoline per interrupt (`pub fn TIMER0()
     //     void { var ctx: context.t0 = .{ .res_a = .{ .ptr = &app.res_a } };
     //     app.t0(&ctx); }`); on hardware these names are the symbols
-    //     the linker drops into the vector table.  `codegen/extract.zig`
-    //     emits them from `pub const tasks` — reading that list
-    //     materializes the handlers, which is fine now: the contexts
-    //     exist by then, the trampoline's context literal is checked
-    //     against the handler's signature, and the handler's declared
-    //     name is checked against the spec's task name.
+    //     the linker drops into the vector table, and with them the
+    //     handler-binding table (`pub const tasks`) the runtime reads.
     //
-    // The two loops — generators need a compiled app, the app needs
-    // their output — are broken by handing each compilation its own
-    // `context`/`vectors` modules:
+    // The chicken-and-egg — the generators need the app's config, the
+    // app imports the files they write — is broken by *not compiling
+    // the app to read it*: `codegen/generate.zig` reads the single
+    // `pub const config` literal with `std.zig.Ast`, the very parser
+    // the compiler uses, so the config may reference handlers and
+    // resource addresses freely — to a reader of text, a reference is
+    // a name, and every name is checked against the declarations of
+    // the same file (a task row must name a `pub fn`, a resource
+    // access a declared variable; a missing name is the generator's
+    // error, before anything is written).  Real RTIC works exactly
+    // this way: its `#[app]` macro reads token streams, not compiled
+    // code.
     //
-    //   * the context generator's copy of the app is wired against
-    //     both committed stubs (codegen/context_stub.zig,
-    //     codegen/vectors_stub.zig): nothing in the handler-free pass
-    //     resolves a name against either;
-    //   * the vector generator's copy gets the freshly generated
-    //     contexts and the stub vectors — its pass analyzes the
-    //     handlers, whose bodies are vector-free; their comptime
-    //     self-lookup goes through the hoisted task list precisely so
-    //     it needs nothing from the stub;
-    //   * the real binaries link both generated files.
+    // The application is then compiled exactly once, against the real
+    // generated files — the emitted trampoline's context literal and
+    // the handler's signature are where the declaration finally meets
+    // its types.  (An earlier design compiled the app twice against
+    // stub `context`/`vectors` modules so the generators could read
+    // `app.config` semantically; it worked only while the config held
+    // no function references — and a reference is what makes the
+    // config the whole system definition.  Text rendering retired the
+    // stubs and the passes with it.)
     //
-    // Two consequences of writing into a plain source path rather
-    // than a declared build-graph output: the steps that consume the
-    // files are ordered after their producers by hand, and neither
-    // generator declares outputs, so both re-run on every build —
-    // delete src/generated/ and `zig build` puts it right back.
+    // The consequence of writing into plain source paths rather than
+    // declared build-graph outputs: the steps that consume the files
+    // are ordered after the generator by hand, and with no declared
+    // outputs it re-runs on every build — delete src/generated/ and
+    // `zig build` puts it right back.
     //
     // The app↔context and app↔vectors module cycles are legal to the
     // compiler: two views of one program.
     // ------------------------------------------------------------------
 
-    // The context generator's view of the app: root with both stubs.
-    const app_for_ctxgen = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .imports = &.{
-            .{ .name = "rticz", .module = mod },
-            .{ .name = "context", .module = b.createModule(.{
-                .root_source_file = b.path("codegen/context_stub.zig"),
-                .target = target,
-            }) },
-            .{ .name = "vectors", .module = b.createModule(.{
-                .root_source_file = b.path("codegen/vectors_stub.zig"),
-                .target = target,
-            }) },
-        },
-        // The host-simulation idle loop sleeps via libc's nanosleep.
-        .link_libc = true,
-    });
-
-    const gen_context_exe = b.addExecutable(.{
-        .name = "gen_context",
+    const generate_exe = b.addExecutable(.{
+        .name = "generate",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("codegen/gen_context.zig"),
+            .root_source_file = b.path("codegen/generate.zig"),
             .target = target,
-            .imports = &.{
-                .{ .name = "app", .module = app_for_ctxgen },
-                .{ .name = "rticz", .module = mod },
-            },
+            .imports = &.{.{ .name = "rticz", .module = mod }},
         }),
     });
-    // The contexts are written into the tree.  A run step's working
-    // directory is the build root, so the path is relative to that;
-    // with no declared output the step re-runs on every build, which
-    // is what makes the visible file self-healing.
-    const gen_context = b.addRunArtifact(gen_context_exe);
-    gen_context.setName("gen-context");
-    gen_context.addArg("src/generated/context.zig");
-
-    // The vector generator's view of the app: stub vectors, real
-    // contexts — which import "app" themselves (the handler-free pass
-    // above has written them by now, ordered below), so the pair is
-    // created first and tied together after.
-    const app_for_extract = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .imports = &.{
-            .{ .name = "rticz", .module = mod },
-            .{ .name = "vectors", .module = b.createModule(.{
-                .root_source_file = b.path("codegen/vectors_stub.zig"),
-                .target = target,
-            }) },
-        },
-        // The host-simulation idle loop sleeps via libc's nanosleep.
-        .link_libc = true,
-    });
-    const contexts_for_extract = b.createModule(.{
-        .root_source_file = b.path("src/generated/context.zig"),
-        .target = target,
-    });
-    contexts_for_extract.addImport("app", app_for_extract);
-    contexts_for_extract.addImport("rticz", mod); // its fields are `Claim` proxies carrying name + ceiling
-    app_for_extract.addImport("context", contexts_for_extract);
-
-    const extract = b.addExecutable(.{
-        .name = "extract",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("codegen/extract.zig"),
-            .target = target,
-            .imports = &.{
-                .{ .name = "app", .module = app_for_extract },
-                .{ .name = "rticz", .module = mod },
-            },
-        }),
-    });
-    // Compiling extract compiles its copy of the app, which imports
-    // the generated contexts: wait for the context generator first.
-    extract.step.dependOn(&gen_context.step);
-    // The vectors are written into the tree, same mechanics as the
-    // contexts: relative path, no declared outputs, self-healing.
-    const gen_vectors = b.addRunArtifact(extract);
-    gen_vectors.setName("gen-vectors");
-    gen_vectors.addArg("src/generated/irq.zig");
+    // Both files are written into the tree; a run step's working
+    // directory is the build root, so the paths are relative to that.
+    const gen_code = b.addRunArtifact(generate_exe);
+    gen_code.setName("gen-code");
+    gen_code.addArg("src/root.zig");
+    gen_code.addArg("src/generated/context.zig");
+    gen_code.addArg("src/generated/irq.zig");
 
     // The shipped view: the application root plus both real modules —
     // each of which imports "app" to reach the declarations it names,
@@ -205,6 +136,7 @@ pub fn build(b: *std.Build) void {
     });
     vectors_mod.addImport("app", app_mod);
     vectors_mod.addImport("context", contexts_mod); // trampolines name their context type
+    vectors_mod.addImport("rticz", mod); // the generated binding table's rows are `rticz.resource.Task`
     contexts_mod.addImport("app", app_mod);
     contexts_mod.addImport("rticz", mod); // its fields are `Claim` proxies carrying name + ceiling
     app_mod.addImport("vectors", vectors_mod);
@@ -222,8 +154,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "rticz", .module = mod },
             // The glue enters idle through the generated `makeIdleCtx`:
             // even the runtime's one context literal is generated, from
-            // the same `idle_spec` the struct was emitted from.
+            // the same idle row of the config the struct was emitted from.
             .{ .name = "context", .module = contexts_mod },
+            // The glue's tests cross-check its dispatch table against
+            // the generated binding table — an @import only analyzed
+            // when read, but read it is.
+            .{ .name = "vectors", .module = vectors_mod },
         },
     });
     const exe = b.addExecutable(.{
@@ -257,8 +193,8 @@ pub fn build(b: *std.Build) void {
     // output, so the build graph does not know the generator produces
     // it: every step that compiles the app (or the glue/test module
     // that imports it) must wait for the generator by hand.
-    exe.step.dependOn(&gen_vectors.step);
-    cli.step.dependOn(&gen_vectors.step);
+    exe.step.dependOn(&gen_code.step);
+    cli.step.dependOn(&gen_code.step);
 
     // `zig build run` boots the program. Note: idle never returns,
     // so this runs until you Ctrl-C it.
@@ -299,7 +235,7 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
     });
     // Glue tests import the app, which imports the generated vectors.
-    exe_tests.step.dependOn(&gen_vectors.step);
+    exe_tests.step.dependOn(&gen_code.step);
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);

@@ -2,39 +2,54 @@
 //! application.
 //!
 //! This module is the entry point of the produced binary.  It reads
-//! `app.config` — the system definition from `src/root.zig` — and turns
-//! its *references* into names at compile time: handlers are matched
-//! against the application namespace by address; resource accesses
-//! carry their names where they are claimed, so there is nothing to
-//! match there.  The handler resolution must happen
-//! out here: a `const` in root that reads root's own declarations via
+//! `app.config` — the one system definition in `src/root.zig` — and
+//! turns its declarations into the analysis vocabulary: interrupt
+//! tasks already *name* their handlers, so their rows are read as
+//! written; the two references the config holds, init and idle, are
+//! matched against the application namespace by address.  Resource
+//! accesses carry their names where they are claimed, so there is
+//! nothing to match there.  The address resolution must happen out
+//! here: a `const` in root that reads root's own declarations via
 //! `@field` is a self-dependency Zig rejects, so the framework walks
 //! the application, never the other way round.  The walk also checks
-//! the definition (duplicate handlers, duplicate resources, valid
+//! the definition (duplicate names, duplicate resources, valid
 //! names), and `main` calls exactly the functions the config names.
 
 const std = @import("std");
 const app = @import("app"); // the application root, src/root.zig — NOT
 const rticz = @import("rticz"); // @import("root"), which would be *this*
-                                // file when glue is the executable entry
+// file when glue is the executable entry
 const context = @import("context"); // the generated task contexts: idle
-                                    // enters through the generated
-                                    // `makeIdleCtx`, just as the vectors
-                                    // enter interrupt tasks through
-                                    // generated context literals
+// enters through the generated
+// `makeIdleCtx`, just as the vectors
+// enter interrupt tasks through
+// generated context literals
+const vectors = @import("vectors"); // the generated trampolines — and
+// with them the generated handler-
+// binding table, which the tests
+// below cross-check against config
 
 pub const config = app.config;
 
+/// The config's interrupt-task rows, as declared: names, lines,
+/// priorities, resource accesses — no addresses, by design.
 pub const tasks = app.config.tasks;
 
-/// The declared-name view of the config: same order as `tasks`, with
-/// handler references resolved to their names in the application
-/// namespace (resource accesses name themselves) — plus the idle task
-/// as the last row, at logical priority 0, because idle is a task too
-/// and its resource accesses are a fact about the system worth
-/// recording.  This is the input to the JSON-shaped analysis; the
-/// ceilings below use only the interrupt-task prefix of it.
-pub const named_tasks = rticz.resource.namedTasks(app.config.tasks, app.config.idle, app);
+/// init and idle are referenced functions; these are their declared
+/// names, resolved by the address walk — for the banner, and because
+/// the idle row of the task table below needs a name.
+pub const init_name = rticz.resource.handlerName(app, app.config.init) orelse
+    @compileError("the application config references an init handler that is not a function declared in the application namespace");
+pub const idle_name = rticz.resource.handlerName(app, app.config.idle.task_id) orelse
+    @compileError("the application config references an idle handler that is not a function declared in the application namespace");
+
+/// The declared-name view of the config: same order as `tasks`, each
+/// row already naming its handler (nothing to resolve), plus the idle
+/// task as the last row, at logical priority 0, because idle is a
+/// task too and its resource accesses are a fact about the system
+/// worth recording.  This is the input to the JSON-shaped analysis;
+/// the ceilings below use only the interrupt-task prefix of it.
+pub const named_tasks = rticz.resource.namedTasks(app.config.tasks, idle_name, app.config.idle.resources);
 
 /// Resource ceilings, derived from the config by the framework — the
 /// application never states them.  The ceiling is computed over the
@@ -50,16 +65,11 @@ pub const named_tasks = rticz.resource.namedTasks(app.config.tasks, app.config.i
 /// applied, which we will want later.
 pub const ceilings = rticz.ceiling.computeAtComptime(named_tasks[0..tasks.len]);
 
-/// init and idle are referenced tasks; these are their declared names,
-/// for the banner.
-pub const init_name = rticz.resource.handlerName(app, app.config.init) orelse
-    @compileError("the application config references an init handler that is not a function declared in the application namespace");
-pub const idle_name = rticz.resource.handlerName(app, app.config.idle.task_id) orelse
-    @compileError("the application config references an idle handler that is not a function declared in the application namespace");
-
 /// A dispatch table: the glue's view of the tasks, as data.  The
-/// `handler` is the very function the config references.  It is held
-/// as an address because handlers take per-task contexts and
+/// `handler` is the function the config row *names* — looked up in
+/// the application namespace by that name, so the table and the
+/// generated trampolines can only ever reach the same function.  It
+/// is held as an address because handlers take per-task contexts and
 /// therefore share no signature; on hardware this table *is* what the
 /// vector entry points at — the generated trampoline, which builds
 /// the context and makes the typed call.
@@ -76,10 +86,17 @@ const DispatchTable = struct { items: [tasks.len]Dispatch };
 const dispatch_table: DispatchTable = blk: {
     var t: DispatchTable = .{ .items = undefined };
     for (tasks, 0..) |task, i| {
+        // The row names its handler; the name must find a public
+        // function of the application.  The generator enforced the
+        // same rule against the app's own declarations before any
+        // file was written — here it guards the table, defense in
+        // depth.
+        if (!std.meta.hasFn(app, task.name))
+            @compileError("a task row names a handler that is not a public function of the application");
         t.items[i] = .{
             .task_id = named_tasks[i].task_id,
             .priority = task.priority,
-            .handler = task.task_id,
+            .handler = &@field(app, task.name),
         };
     }
     break :blk .{ .items = t.items };
@@ -124,8 +141,8 @@ pub fn main(init: std.process.Init) !void {
     // idle is a task: the config references its handler, and like
     // every task it takes a context — the glue enters idle with the
     // generated `makeIdleCtx`, whose literal lives in the same file
-    // as the struct, built from the same `idle_spec` the struct was
-    // emitted from.  Unlike a trampoline frame, this context lives
+    // as the struct, built from the same idle row of the config the
+    // struct was emitted from.  Unlike a trampoline frame, this context lives
     // exactly as long as idle's single activation: the runtime loop
     // that never returns.
     const idle_fn = app.config.idle.task_id;
@@ -217,9 +234,17 @@ test "generated tables are consistent" {
         try std.testing.expectEqual(task.priority, entry.priority);
         try std.testing.expectEqualStrings(task.interrupt_id, named.interrupt_id);
 
-        // The dispatch table holds the very function the config
-        // references.
-        try std.testing.expectEqual(@intFromPtr(task.task_id), @intFromPtr(entry.handler));
+        // Both tables resolve the row's name to a function — the
+        // dispatch table via `@field`, the generated binding table
+        // via a declared reference — and they must land on the same
+        // one.
+        const bound = vectors.tasks[i];
+        try std.testing.expectEqualStrings(task.name, bound.name);
+        try std.testing.expectEqual(task.priority, bound.priority);
+        try std.testing.expect(std.meta.eql(
+            @as(*const anyopaque, entry.handler),
+            @as(*const anyopaque, bound.task_id),
+        ));
     }
 }
 

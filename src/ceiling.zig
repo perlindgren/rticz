@@ -11,7 +11,7 @@ const Allocator = std.mem.Allocator;
 const parser = @import("parser.zig");
 
 pub const ResourceCeiling = struct {
-    /// Resource name as it appears in `rticz.json`.
+    /// Resource name as declared — in the config or in `rticz.json`.
     name: []const u8,
     /// Highest priority of any task referencing this resource.
     ceiling: u8,
@@ -120,10 +120,8 @@ const testing = std.testing;
 test "ceiling is the max priority of accessing tasks" {
     const gpa = testing.allocator;
     const tasks = [_]parser.Task{
-        .{ .task_id = "t0", .interrupt_id = "TIMER0", .priority = 1,
-           .resources = &.{ "res_a", "res_b" } },
-        .{ .task_id = "t1", .interrupt_id = "TIMER1", .priority = 2,
-           .resources = &.{ "res_b", "res_c" } },
+        .{ .task_id = "t0", .interrupt_id = "TIMER0", .priority = 1, .resources = &.{ "res_a", "res_b" } },
+        .{ .task_id = "t1", .interrupt_id = "TIMER1", .priority = 2, .resources = &.{ "res_b", "res_c" } },
     };
 
     const ceilings = try compute(gpa, &tasks);
@@ -166,10 +164,8 @@ test "tasks without resources contribute nothing" {
 
 test "computeAtComptime is checked by the compiler itself" {
     const tasks = [_]parser.Task{
-        .{ .task_id = "t0", .interrupt_id = "TIMER0", .priority = 1,
-           .resources = &.{ "res_a", "res_b" } },
-        .{ .task_id = "t1", .interrupt_id = "TIMER1", .priority = 2,
-           .resources = &.{ "res_b", "res_c" } },
+        .{ .task_id = "t0", .interrupt_id = "TIMER0", .priority = 1, .resources = &.{ "res_a", "res_b" } },
+        .{ .task_id = "t1", .interrupt_id = "TIMER1", .priority = 2, .resources = &.{ "res_b", "res_c" } },
     };
     // Entirely inside `comptime`: if the tables below are even one entry
     // wrong, this file does not compile — the test *is* the assertion.
