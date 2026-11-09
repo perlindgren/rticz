@@ -12,15 +12,15 @@ zig-out/
 # to keep listed for projects that grow dependencies).
 .deps/
 
-# Codegen lives in src/generated/: the generators, the stubs they
-# compile against, and the modules they emit — nothing codegen-related
-# outside this folder.  The tools and stubs are committed (they are
-# hand-written); only what the build *emits* is ignored: `zig build`
-# rewrites these files on every run, so committing them would only
-# invite stale copies.  They are placed in the source tree, not the
-# build cache, so the emitted table and contexts are readable as-is.
-src/generated/irq.zig
-src/generated/context.zig
+# Emitted build artifacts.  The hand-written codegen tools live in
+# codegen/ (committed, framework-owned); src/generated/ holds only
+# what they emit — the vector table and the per-task contexts — so
+# the whole folder is ignored: `zig build` rewrites these files on
+# every run, and committing them would only invite stale copies.
+# They are placed in the source tree, not the build cache, so the
+# emitted table and contexts stay readable as-is; the generators
+# recreate the folder itself, which is why it may be absent entirely.
+src/generated/
 
 # Editor / OS cruft.
 *.swp

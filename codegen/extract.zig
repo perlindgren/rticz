@@ -18,13 +18,13 @@
 //! *   reading the task list materializes the handler references,
 //!     which forces the handlers' analysis, which names their context
 //!     types — so this pass needs the real contexts, and runs after
-//!     src/generated/gen_context.zig wrote them;
+//!     codegen/gen_context.zig wrote them;
 //! *   but the application imports the vectors that this tool writes,
 //!     so it cannot compile against its real vectors before they
 //!     exist.
 //!
 //! build.zig breaks the cycle by wiring the generator's copy of the
-//! app against the committed stub src/generated/vectors_stub.zig instead of the
+//! app against the committed stub codegen/vectors_stub.zig instead of the
 //! real vectors, and against the freshly generated contexts.  The
 //! stub is honest for this tool because it reads `app.tasks`, never
 //! `app.config`: materializing the full config materializes idle's
@@ -55,7 +55,7 @@ const header =
     \\//! GENERATED FILE — do not edit.
     \\//!
     \\//! Interrupt vectors for the application in src/root.zig, emitted
-    \\//! by src/generated/extract.zig from `pub const tasks` during `zig build`,
+    \\//! by codegen/extract.zig from `pub const tasks` during `zig build`,
     \\//! which rewrites this file on every run.  Git-ignored: here to
     \\//! be read, not to be committed.
     \\//! On real hardware these names are the symbols the linker places
@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
         };
 
         // The context literal's fields: the names the task claimed,
-        // carried by its access list — the same list src/generated/gen_context.zig
+        // carried by its access list — the same list codegen/gen_context.zig
         // emitted the handler's context struct from, so the literal
         // this hardware entry point constructs is checked, field for
         // field and type for type, against what the handler declares

@@ -7,7 +7,7 @@
 //! glue layer reads them, derives the resource ceilings and the task
 //! table from them at compile time, and prints the report in `main`.
 //! Nothing is parsed.  And even RTIC's per-task context structs are
-//! never handwritten: `src/generated/gen_context.zig` reads `task_specs` and
+//! never handwritten: `codegen/gen_context.zig` reads `task_specs` and
 //! *emits* one context struct per interrupt into
 //! `src/generated/context.zig`, imported as `context` below — a
 //! handler's signature simply names `context.TIMER0`, and nothing
@@ -20,9 +20,9 @@
 //! src/generated/ — visible, regenerated every build:
 //!
 //! *   `context.zig` — the per-task context structs, from
-//!     `task_specs` (src/generated/gen_context.zig);
+//!     `task_specs` (codegen/gen_context.zig);
 //! *   `irq.zig` — one trampoline per `interrupt_id`, which builds
-//!     the context struct and calls its handler (src/generated/extract.zig);
+//!     the context struct and calls its handler (codegen/extract.zig);
 //!     on hardware these names are the vector-table symbols.
 //!
 //! Handlers are plain file-scope functions taking their context, so
@@ -33,7 +33,7 @@
 const std = @import("std");
 const rticz = @import("rticz");
 
-// The per-task contexts: a module emitted by src/generated/gen_context.zig
+// The per-task contexts: a module emitted by codegen/gen_context.zig
 // from `task_specs` below, during the build.  The import is a
 // deliberate cycle — the contexts import "app" to reach the resource
 // declarations they point into, and the app imports "context" to
@@ -41,12 +41,12 @@ const rticz = @import("rticz");
 // of one program.
 const context = @import("context");
 
-// The interrupt vector table: a module emitted by src/generated/extract.zig
+// The interrupt vector table: a module emitted by codegen/extract.zig
 // from the task list below, during the build.  The same deliberate
 // cycle: the vectors import "app" to reach the handlers, and the app
 // imports "vectors" to call them.  build.zig supplies both modules:
 // while generating, the app is compiled against the committed stubs
-// src/generated/context_stub.zig and src/generated/vectors_stub.zig; what ships links
+// codegen/context_stub.zig and codegen/vectors_stub.zig; what ships links
 // the generated files, src/generated/context.zig and
 // src/generated/irq.zig — in the tree for anyone to read,
 // regenerated on every build.

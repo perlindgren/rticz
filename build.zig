@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
     // reached through a function whose *name* is the vector's name,
     // and Zig has no hook to place symbols in a vector table.  Both
     // artifacts are generated — see the codegen section below
-    // (src/generated/gen_context.zig, src/generated/extract.zig).
+    // (codegen/gen_context.zig, codegen/extract.zig).
     // ------------------------------------------------------------------
 
     // The library: config data model, JSON parser (for the CLI), ceiling
@@ -62,13 +62,13 @@ pub fn build(b: *std.Build) void {
     //     a handler-free view of the app — `pub const task_specs`
     //     (interrupt lines, priorities, named resource accesses; no
     //     function references in it, so reading it forces no handler
-    //     analysis).  `src/generated/gen_context.zig` emits the structs, typed
+    //     analysis).  `codegen/gen_context.zig` emits the structs, typed
     //     `*@TypeOf(app.res_x)` over the application's own resource
     //     declarations.
     //   * `irq.zig` — one trampoline per interrupt (`pub fn TIMER0()
     //     void { app.t0(.{ .res_a = &app.res_a }); }`); on hardware
     //     these names are the symbols the linker drops into the
-    //     vector table.  `src/generated/extract.zig` emits them from
+    //     vector table.  `codegen/extract.zig` emits them from
     //     `pub const tasks` — reading that list materializes the
     //     handlers, which is fine now: the contexts exist by then,
     //     and the trampoline's context literal is checked against
@@ -79,8 +79,8 @@ pub fn build(b: *std.Build) void {
     // `context`/`vectors` modules:
     //
     //   * the context generator's copy of the app is wired against
-    //     both committed stubs (src/generated/context_stub.zig,
-    //     src/generated/vectors_stub.zig): nothing in the handler-free pass
+    //     both committed stubs (codegen/context_stub.zig,
+    //     codegen/vectors_stub.zig): nothing in the handler-free pass
     //     resolves a name against either;
     //   * the vector generator's copy gets the freshly generated
     //     contexts and the stub vectors — its pass analyzes the
@@ -106,11 +106,11 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "rticz", .module = mod },
             .{ .name = "context", .module = b.createModule(.{
-                .root_source_file = b.path("src/generated/context_stub.zig"),
+                .root_source_file = b.path("codegen/context_stub.zig"),
                 .target = target,
             }) },
             .{ .name = "vectors", .module = b.createModule(.{
-                .root_source_file = b.path("src/generated/vectors_stub.zig"),
+                .root_source_file = b.path("codegen/vectors_stub.zig"),
                 .target = target,
             }) },
         },
@@ -121,7 +121,7 @@ pub fn build(b: *std.Build) void {
     const gen_context_exe = b.addExecutable(.{
         .name = "gen_context",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/generated/gen_context.zig"),
+            .root_source_file = b.path("codegen/gen_context.zig"),
             .target = target,
             .imports = &.{
                 .{ .name = "app", .module = app_for_ctxgen },
@@ -147,7 +147,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "rticz", .module = mod },
             .{ .name = "vectors", .module = b.createModule(.{
-                .root_source_file = b.path("src/generated/vectors_stub.zig"),
+                .root_source_file = b.path("codegen/vectors_stub.zig"),
                 .target = target,
             }) },
         },
@@ -164,7 +164,7 @@ pub fn build(b: *std.Build) void {
     const extract = b.addExecutable(.{
         .name = "extract",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/generated/extract.zig"),
+            .root_source_file = b.path("codegen/extract.zig"),
             .target = target,
             .imports = &.{
                 .{ .name = "app", .module = app_for_extract },

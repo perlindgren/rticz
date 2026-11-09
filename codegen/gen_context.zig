@@ -30,9 +30,9 @@
 //!     stay unanalyzed, their unresolvable signatures never looked at.
 //!
 //! build.zig wires this generator's copy of the app against the
-//! committed stubs src/generated/context_stub.zig (empty: nothing here resolves
-//! a context against it) and src/generated/vectors_stub.zig.  The vector
-//! generator (src/generated/extract.zig) then runs *after* this one, compiling
+//! committed stubs codegen/context_stub.zig (empty: nothing here resolves
+//! a context against it) and codegen/vectors_stub.zig.  The vector
+//! generator (codegen/extract.zig) then runs *after* this one, compiling
 //! the app against the freshly generated contexts — which is where
 //! the handler signatures are finally checked.
 //!
@@ -63,7 +63,7 @@ const header =
     \\//! GENERATED FILE — do not edit.
     \\//!
     \\//! Task contexts for the application in src/root.zig, emitted
-    \\//! by src/generated/gen_context.zig from `pub const task_specs` during
+    \\//! by codegen/gen_context.zig from `pub const task_specs` during
     \\//! `zig build`, which rewrites this file on every run.
     \\//! Git-ignored: here to be read, not to be committed.
     \\//!

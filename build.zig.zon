@@ -72,6 +72,10 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        // The framework's codegen tools ship with the package: an
+        // application that depends on rticz builds these generators
+        // against its own app module.
+        "codegen",
         // For example...
         //"LICENSE",
         //"README.md",

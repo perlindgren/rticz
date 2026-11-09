@@ -43,7 +43,7 @@
 //!
 //! Task handlers take a per-task *context* (RTIC's `Context`): a
 //! plain struct named after the interrupt, generated into
-//! `src/generated/context.zig` by `src/generated/gen_context.zig` from the very
+//! `src/generated/context.zig` by `codegen/gen_context.zig` from the very
 //! `task_specs` declared here — one field per accessed resource,
 //! typed `*T` over the application's declaration.  Handlers therefore
 //! do not share a signature, which is why a task's `task_id`
