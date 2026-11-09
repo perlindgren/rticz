@@ -10,11 +10,18 @@
 //! generated, into the application's generated/ folder (git-ignored, but in the tree for
 //! anyone to read, rewritten on every build):
 //!
+//! *   `storage.zig` — one `pub var` per resource, emitted from the
+//!     declarations in `config.resources`: the type and initializer
+//!     copied as text, the application's names `app.`-qualified.
+//!     This module is the resources' only home, and the application
+//!     cannot import it — the build wires it only to the generated
+//!     modules — so the instances exist beyond the application's
+//!     reach by construction, not by convention.
 //! *   `context.zig` — one context struct per task, named after it
 //!     (`context.t0`, RTIC's `Context<T0>`), each field a `Claim`
 //!     proxy carrying the resource's name and priority ceiling in its
-//!     type, typed `@TypeOf(app.res_x)` over the application's own
-//!     declaration; plus `context.idle` and the `makeIdleCtx`
+//!     type, typed `@TypeOf(storage.res_x)` over the generated
+//!     storage; plus `context.idle` and the `makeIdleCtx`
 //!     constructor the glue uses to enter idle, emitted beside the
 //!     struct so it can never drift from it.
 //! *   `irq.zig` — one trampoline per interrupt, building the task's
@@ -27,9 +34,10 @@
 //! app imports its vectors, the generators need the app — is broken
 //! *without compiling the app at all*: codegen/appsrc.zig reads the
 //! `pub const config` literal with the same parser the compiler uses
-//! (`std.zig.Ast`), so the config may reference handlers and resource
-//! addresses freely — to a reader of text, a reference is a name, and
-//! every name is checked against the declarations of the same file.
+//! (`std.zig.Ast`), so the config may reference handlers and spell
+//! resource declarations freely — to a reader of text, a reference is
+//! a name, and every name is checked against the declarations of the
+//! same file.
 //! The application then compiles exactly once, against the real
 //! generated files: the emitted trampoline calls the handler with a
 //! context literal that must type-check against the handler's
@@ -41,9 +49,10 @@
 //! stops the build with its message, and never leaves half a vector
 //! table on disk.
 //!
-//! Usage: `generate <app source> <context output> <vectors output>` —
-//! paths as relative to the build root, which is a run step's working
-//! directory; the tool creates the output folder if missing.
+//! Usage: `generate <app source> <storage output> <context output>
+//! <vectors output>` — paths as relative to the build root, which is
+//! a run step's working directory; the tool creates the output folder
+//! if missing.
 
 const std = @import("std");
 const Io = std.Io;
@@ -61,17 +70,38 @@ const context_header =
     \\//!
     \\//! One struct per task, named after the task (plus `idle`, the
     \\//! runtime's own context): the fields are that task's declared
-    \\//! resources, each a `Claim` proxy over the application's own
-    \\//! declaration carrying the resource's name and priority
-    \\//! ceiling in its type — so a handler reaches the instance it
-    \\//! claimed, only inside a claimed critical section, and under
-    \\//! the mask its ceiling names (printed for now; BASEPRI when
-    \\//! the runtime can), and the generated vector's context literal
-    \\//! is checked against this struct, field for field and type for
-    \\//! type.
+    \\//! resources, each a `Claim` proxy over the sibling generated
+    \\//! storage carrying the resource's name and priority ceiling in
+    \\//! its type — so a handler reaches the instance it claimed,
+    \\//! only inside a claimed critical section, and under the mask
+    \\//! its ceiling names (printed for now; BASEPRI when the runtime
+    \\//! can), and the generated vector's context literal is checked
+    \\//! against this struct, field for field and type for type.
+    \\
+    \\const storage = @import("storage");
+    \\const rticz = @import("rticz");
+    \\
+;
+
+const storage_header =
+    \\//! GENERATED FILE — do not edit.
+    \\//!
+    \\//! Resource storage for the application beside it (root.zig),
+    \\//! emitted by rticz's codegen/generate.zig from the declarations
+    \\//! in `pub const config.resources` during `zig build`, which
+    \\//! rewrites this file on every run.  Git-ignored: here to be
+    \\//! read, not to be committed.
+    \\//!
+    \\//! One `pub var` per declaration: the type and initializer the
+    \\//! config wrote, copied as text, the application's own names
+    \\//! `app.`-qualified.  This is where every resource *lives* —
+    \\//! the application cannot import this module (the build wires
+    \\//! it only to the generated ones), so no line of application
+    \\//! code can name an instance, take its address, or write it
+    \\//! outside a `claim`: the instances are beyond the application's
+    \\//! reach by construction, not by convention.
     \\
     \\const app = @import("app");
-    \\const rticz = @import("rticz");
     \\
 ;
 
@@ -89,7 +119,7 @@ const irq_header =
     \\//! Each one builds its task's context struct — the sibling
     \\//! generated module names contexts after their task, so this is
     \\//! `context.t0`, not `context.TIMER0` — filling each field with
-    \\//! a `Claim` proxy over the application's declaration, then
+    \\//! a `Claim` proxy over the sibling generated storage, then
     \\//! calls the handler with a pointer to it: the call type-checks
     \\//! the task's whole declaration, handler signature included, and
     \\//! the handler reaches each resource only by `claim`ing its
@@ -101,6 +131,7 @@ const irq_header =
     \\const app = @import("app");
     \\const context = @import("context");
     \\const rticz = @import("rticz");
+    \\const storage = @import("storage");
     \\
 ;
 
@@ -109,13 +140,14 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len != 4) {
-        std.debug.print("generate: expected three arguments: the app source, the context output, the vectors output\n", .{});
+    if (args.len != 5) {
+        std.debug.print("generate: expected four arguments: the app source, the storage output, the context output, the vectors output\n", .{});
         std.process.exit(2);
     }
     const app_path = args[1];
-    const ctx_path = args[2];
-    const irq_path = args[3];
+    const storage_path = args[2];
+    const ctx_path = args[3];
+    const irq_path = args[4];
 
     const source = Io.Dir.cwd().readFileAllocOptions(io, app_path, arena, .unlimited, .of(u8), 0) catch |err| {
         std.debug.print("generate: cannot read the application source '{s}': {t}\n", .{ app_path, err });
@@ -149,8 +181,36 @@ pub fn main(init: std.process.Init) !void {
     }
     const ceilings = try rticz.ceiling.compute(arena, tasks);
 
+    try emitStorage(io, storage_path, &app);
     try emitContexts(io, arena, ctx_path, &app, ceilings);
     try emitVectors(io, irq_path, &app);
+}
+
+/// The storage module: one `pub var` per config declaration, the type
+/// and initializer exactly as `config.resources` spelled them (with
+/// the application's names `app.`-qualified — appsrc did that on the
+/// way out).  Nothing here is computed: the declaration is the text,
+/// and this file is where that text lives.  The names are validated
+/// before anything is written — they become declarations.
+fn emitStorage(io: Io, path: []const u8, app: *const appsrc.App) !void {
+    for (app.resources) |decl| {
+        if (!rticz.parser.isZigIdentifier(decl.name)) {
+            std.debug.print("generate: resource '{s}' is not a valid Zig identifier, " ++
+                "so no storage declaration can be generated for it\n", .{decl.name});
+            std.process.exit(1);
+        }
+    }
+    var file = try openOut(io, path);
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var file_writer: Io.File.Writer = .init(file, io, &buf);
+    const w = &file_writer.interface;
+
+    try w.writeAll(storage_header);
+    for (app.resources) |decl| {
+        try w.print("pub var {s}: {s} = {s};\n", .{ decl.name, decl.storage_type, decl.init_expr });
+    }
+    try w.flush();
 }
 
 /// The ceiling a claim of `name` raises to: the highest priority of
@@ -243,13 +303,13 @@ fn emitContexts(io: Io, arena: std.mem.Allocator, path: []const u8, app: *const 
     // runtime loop — so its context is built once, by whoever enters
     // idle.  The constructor is emitted rather than handwritten by
     // the glue for the same reason the structs are: it names the
-    // application's declarations by address (`&app.res_x`), so it can
-    // never drift from the declaration that claimed them.  The
+    // storage instances by address (`&storage.res_x`), so it can
+    // never drift from the declarations that hold them.  The
     // proxies come fresh with it, and live exactly as long as idle
     // runs — which is forever.
     try w.print("pub fn makeIdleCtx() idle {{\n    return .{{", .{});
     for (app.idle_resources, 0..) |res, j| {
-        try w.print("{s} .{s} = .{{ .ptr = &app.{s} }}", .{ if (j != 0) "," else "", res, res });
+        try w.print("{s} .{s} = .{{ .ptr = &storage.{s} }}", .{ if (j != 0) "," else "", res, res });
     }
     try w.print(" }};\n}}\n", .{});
 
@@ -257,9 +317,9 @@ fn emitContexts(io: Io, arena: std.mem.Allocator, path: []const u8, app: *const 
 }
 
 /// One context's fields: the resources the task declared, each a
-/// `Claim` proxy.  The pointee type is the application's declaration
-/// itself speaking — `@TypeOf(app.res_x)`, not a type name printed
-/// here: whatever the programmer writes at the declaration — a
+/// `Claim` proxy.  The pointee type is the storage declaration
+/// itself speaking — `@TypeOf(storage.res_x)`, not a type name
+/// printed here: whatever the config wrote at the declaration — a
 /// generic instance, a typedef — flows into the context without this
 /// file ever going stale.  The name and `ceilingFor(res)` ride in
 /// beside it because the proxy cannot introspect either — it is a
@@ -282,7 +342,7 @@ fn emitFields(w: *Io.Writer, owner: []const u8, resources: []const []const u8, c
                 std.process.exit(1);
             }
         }
-        try w.print("    {s}: rticz.resource.Claim(\"{s}\", @TypeOf(app.{s}), {d}),\n", .{ res, res, res, ceilingFor(ceilings, res) });
+        try w.print("    {s}: rticz.resource.Claim(\"{s}\", @TypeOf(storage.{s}), {d}),\n", .{ res, res, res, ceilingFor(ceilings, res) });
     }
 }
 
@@ -368,7 +428,7 @@ fn emitVectors(io: Io, path: []const u8, app: *const appsrc.App) !void {
         // mismatched handler is a type error, here.
         try w.print("    var ctx: context.{s} = .{{", .{task.name});
         for (task.resources, 0..) |res, j| {
-            try w.print("{s} .{s} = .{{ .ptr = &app.{s} }}", .{ if (j != 0) "," else "", res, res });
+            try w.print("{s} .{s} = .{{ .ptr = &storage.{s} }}", .{ if (j != 0) "," else "", res, res });
         }
         try w.print(" }};\n    app.{s}(&ctx);\n}}\n", .{task.name});
     }

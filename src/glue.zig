@@ -178,12 +178,11 @@ fn printSystemDefinition() void {
     std.debug.print("  entry points: init={s}, idle={s} (referenced in config)\n", .{ init_name, idle_name });
 }
 
-/// A resource as the system declares it: its name and the declared
-/// type of the application's own instance.  Both facts are carried by
-/// the access references themselves — each was written as
-/// `.name = &name`, so name and type came straight from the
-/// declaration the task pointed at; nothing here reflects into the
-/// application to recover them.
+/// A resource as the system shows it: its name, and the declared
+/// type of its storage instance.  The name comes from an access list;
+/// the type comes from the resource's declaration in `config
+/// .resources` — the one place a type is ever spelled — via
+/// `@typeName` over the type the declaration carried.
 pub const ResourceInfo = struct {
     name: []const u8,
     type_name: []const u8,
@@ -193,11 +192,14 @@ pub const ResourceInfo = struct {
 /// order: the interrupt tasks as declared, then idle's own list.
 /// Built in a comptime const initializer, so the "runtime" loops
 /// below are compile-time evaluation; the walk reads the config's
-/// `ResourceRef`s directly, which carry name and type as written at
-/// the claim.  The table is frozen as a container-level `const`, and
-/// the public slice is taken from it — a slice escaping into a global
-/// must point into constant memory, and a comptime `var` does not
-/// qualify.
+/// access names and looks each one up in the declarations, which is
+/// where its type lives.  An access naming an undeclared resource is
+/// the same error the generator refused before writing a file — here
+/// it is defense in depth, and it is what makes the *types* in the
+/// generated storage provably the types the tasks reach.  The table
+/// is frozen as a container-level `const`, and the public slice is
+/// taken from it — a slice escaping into a global must point into
+/// constant memory, and a comptime `var` does not qualify.
 const ResourceTable = struct { items: [64]ResourceInfo, len: usize };
 
 const resource_table: ResourceTable = blk: {
@@ -213,10 +215,16 @@ const resource_table: ResourceTable = blk: {
         for (list) |res| {
             var known = false;
             for (rows[0..count]) |row| {
-                if (std.mem.eql(u8, row.name, res.name)) known = true;
+                if (std.mem.eql(u8, row.name, res)) known = true;
             }
             if (known) continue;
-            rows[count] = .{ .name = res.name, .type_name = res.type_name };
+            var type_name: ?[]const u8 = null;
+            for (app.config.resources) |decl| {
+                if (std.mem.eql(u8, decl.name, res)) type_name = @typeName(decl.T);
+            }
+            const found = type_name orelse
+                @compileError("a task accesses a resource that config.resources does not declare");
+            rows[count] = .{ .name = res, .type_name = found };
             count += 1;
         }
     }
