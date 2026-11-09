@@ -1,22 +1,24 @@
-//! rticz — command-line tool: read an `rticz.json` task configuration,
-//! compute resource priority ceilings, and print the analysis to the terminal.
+//! rticz-cli — command-line tool: print the resource ceiling analysis of
+//! the task configuration compiled into the binary (src/root.zig), or of
+//! any `rticz.json`-formatted file given as an argument.
 
 const std = @import("std");
 const Io = std.Io;
 
 const rticz = @import("rticz");
-const analysis = @import("analysis");
+const glue = @import("glue");
 
 const usage =
     \\rticz — resource ceiling analysis for RTIC task configurations
     \\
     \\usage: rticz [OPTIONS] [FILE]
     \\
-    \\With no FILE, prints the task table and resource priority ceilings that
-    \\were parsed, validated, and computed at build time from the configured
-    \\input (see -Dconfig in `zig build --help`).
+    \\With no FILE, prints the task table and resource priority ceilings
+    \\computed at compile time from `pub const config` in the application
+    \\root (src/root.zig).
     \\
-    \\With a FILE, parses and analyzes that file at runtime instead.
+    \\With a FILE, parses and analyzes an rticz.json-formatted configuration
+    \\at runtime instead.
     \\
     \\Arguments:
     \\  FILE          configuration file to analyze at runtime
@@ -68,8 +70,11 @@ pub fn main(init: std.process.Init) !void {
         const ceilings = rticz.ceiling.compute(arena, parsed.value) catch |err| fail(stderr, file, err);
         try printReport(stdout, file, parsed.value, ceilings);
     } else {
-        // Default mode: zero-parse report from build-time computed constants.
-        try printReport(stdout, analysis.source_file, &analysis.tasks, &analysis.ceilings);
+        // Default mode: zero-parse report. `glue.named_tasks` and
+        // `glue.ceilings` are constants the compiler derived from
+        // `pub const config` in src/root.zig — this binary just prints the
+        // tables that are already baked into it.
+        try printReport(stdout, "compiled-in config (src/root.zig)", glue.named_tasks, glue.ceilings);
     }
 
     try stdout.flush();

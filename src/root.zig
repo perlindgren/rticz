@@ -1,90 +1,161 @@
-//! Application root of the rticz program.
+//! The application.  Everything lives in one file: typed resources,
+//! the task handlers, and the system definition `config` that ties
+//! them together by reference — init, idle, and the interrupt tasks
+//! are all just functions referenced by name.
 //!
-//! This is the RTIC-style hand-written half of the application: it implements
-//! `init`, `idle`, and one handler function per task declared in the build
-//! configuration (`rticz.json`, analyzed by build.zig at build time). The
-//! generated glue (also produced at build time) verifies at comptime that
-//! every declared task has its handler right here, then boots:
+//! `config` is the single source of truth: the glue layer reads it,
+//! derives the resource ceilings and the task table from it at
+//! compile time, and prints the report in `main`.  Nothing is parsed
+//! and no code is generated; the Zig compiler *is* the generator.
 //!
-//!     init();
-//!     idle();  // never returns
-//!
-//! The `analysis` module imported below is generated code: the task table and
-//! the resource priority ceilings were computed from rticz.json during
-//! `zig build` and are compiled into the binary as constants.
+//! Handlers are plain file-scope functions, so a config entry is
+//! simply `.task_id = t0`.  A handler may as well come from another
+//! file — `const t0 = @import("irq.zig").t0;` — an imported alias is
+//! just as addressable.
 
 const std = @import("std");
+const rticz = @import("rticz");
 
-pub const analysis = @import("analysis");
+pub const config: rticz.ResourceConfig = .{
+    // init and idle are tasks, so they are declared like tasks:
+    // references to functions, no invented names.  init runs before
+    // interrupts are enabled — nothing races it, so it declares no
+    // resource list.  idle is the lowest-priority context: logical
+    // priority 0 comes from being idle, not from a declaration, so it
+    // states only what is a choice — the resources it touches.
+    .init = init,
+    .idle = .{
+        .task_id = idle,
+        .resources = &.{&resources.res_c},
+    },
 
-/// RTIC `#[init]`: runs exactly once before idle. Prints the task table and
-/// the build-time computed resource ceilings — no JSON parsing at runtime.
-pub fn init() void {
-    std.debug.print(
-        "rticz boot: {d} task(s), {d} resource(s) — analyzed at build time from {s}\n\n",
-        .{ analysis.tasks.len, analysis.ceilings.len, analysis.source_file },
-    );
+    .tasks = &.{
+        .{
+            .task_id = t0,
+            .interrupt_id = "TIMER0",
+            .priority = 1,
+            .resources = &.{ &resources.res_a, &resources.res_b },
+        },
+        .{
+            .task_id = t1,
+            .interrupt_id = "UART0",
+            .priority = 2,
+            .resources = &.{ &resources.res_b, &resources.res_c },
+        },
+    },
+};
 
-    for (analysis.tasks) |task| {
-        std.debug.print("  task {s:<4} interrupt={s:<8} priority={d} resources=[", .{
-            task.task_id, task.interrupt_id, task.priority,
-        });
-        for (task.resources, 0..) |res, j| {
-            if (j != 0) std.debug.print(", ", .{});
-            std.debug.print("{s}", .{res});
-        }
-        std.debug.print("]\n", .{});
-    }
-    std.debug.print("\n", .{});
-    for (analysis.ceilings) |c| {
-        std.debug.print("  resource {s:<8} ceiling={d}\n", .{ c.name, c.ceiling });
-    }
-    std.debug.print("\n", .{});
-}
-
-/// Task handler for the task declared as "t0" in the configuration.
-/// The generated dispatch table wires interrupt TIMER0 here.
+/// Every interrupt context of the application would be a handler of
+/// this shape.  The host build keeps them as functions the idle task
+/// calls in sequence.
+///
+/// A handler referenced from the system definition is part of the
+/// application's visible surface: the framework resolves references by
+/// walking the module's *public* declarations, so `t0` and `t1` are
+/// `pub` — exactly what a name-based config could name across files.
 pub fn t0() void {
-    std.debug.print("    [t0] ran (priority {d})\n", .{priorityOf("t0")});
+    resources.res_a += 1;
+    resources.res_b.x += 1;
+    // A handler can ask its own priority — from the config table, at
+    // comptime, off the function's own address.
+    comptime {
+        if (priorityOf(&t0) != 1) @compileError("t0 must run at priority 1");
+    }
 }
 
-/// Task handler for the task declared as "t1" in the configuration.
-/// The generated dispatch table wires interrupt TIMER1 here.
 pub fn t1() void {
-    std.debug.print("    [t1] ran (priority {d})\n", .{priorityOf("t1")});
+    resources.res_b.y += 1;
+    resources.res_c.set("from t1") catch {};
 }
 
-/// RTIC `#[idle]`: the lowest-priority context; runs forever.
-/// `noreturn` is verified at comptime by the generated glue.
+/// The priority assigned to `handler` in `config`.  The address of a
+/// function is stable, so a handler can look itself up in the table
+/// it is declared in.  `inline` + `comptime` parameter: the lookup
+/// runs at every call site at compile time — even from the idle task's
+/// runtime code — and a handler missing from `config` is a compile
+/// error there.
+pub inline fn priorityOf(comptime handler: rticz.Handler) u8 {
+    for (config.tasks) |task| {
+        if (task.task_id == handler) return task.priority;
+    }
+    @compileError("handler is not declared in config");
+}
+
+// ── Resources ───────────────────────────────────────────────────────
+
+/// A 2-D point — a resource with structure.
+pub const Position = struct {
+    x: u32 = 0,
+    y: u32 = 0,
+};
+
+/// A string with a compile-time capacity.  The `set` call fails at
+/// *runtime* when the value is too long; the capacity is a type
+/// parameter.
+pub const Label = rticz.text.BoundedString(32);
+
+/// The application's shared state.  Each field is one resource; the
+/// analysis talks about them by address, so two fields of the same
+/// type are two distinct resources.
+pub const ResourceStore = struct {
+    /// Plain counter — `res_a` in the sample system.
+    res_a: u64 = 0,
+    /// Struct resource — `res_b` in the sample system.
+    res_b: Position = .{},
+    /// Bounded-string resource — `res_c` in the sample system.
+    res_c: Label = Label.init("rticz"),
+};
+
+pub var resources: ResourceStore = .{};
+
+// ── Entry points ────────────────────────────────────────────────────
+
+/// Application startup: runs before the scheduler enables interrupts,
+/// so no task can be racing it.
+pub fn init() void {
+    std.debug.print("application init: res_c = \"{s}\", priorityOf(t1) = {d}\n", .{
+        resources.res_c.slice(),
+        comptime priorityOf(&t1),
+    });
+}
+
+/// The idle loop: the lowest-priority context of the system (logical
+/// priority 0), running only while nothing else does.  It publishes
+/// the beat through `res_c` — the access the config declares for it —
+/// and calls the handlers in the order the simulated priorities
+/// dictate; on real hardware each call site is instead an interrupt.
 pub fn idle() noreturn {
-    std.debug.print("idle: entering forever loop (Ctrl-C to exit)\n", .{});
     var beat: usize = 0;
     while (true) : (beat += 1) {
-        std.debug.print("\n[idle] beat {d} — dispatching in descending priority\n", .{beat});
-        // On real hardware, t0/t1 fire from their bound interrupts
-        // (TIMER0/TIMER1) and preempt idle. On the host we simulate the
-        // scheduler tick by dispatching ready tasks highest-priority first.
-        // With the ceiling protocol active, t0 would additionally inherit
-        // ceiling(res_b) = 2 while it holds res_b.
         t1();
         t0();
-        sleepMs(2_000);
+
+        // Publish the beat through the resource, not around it: the
+        // config says idle touches `res_c`, and here it does.
+        // `beat_msg_len` bounds the worst case, so neither format can
+        // overflow its buffer ("beat " + 20 digits ≤ 32 = capacity).
+        var msg_buf: [beat_msg_len]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "beat {d}", .{beat}) catch unreachable;
+        resources.res_c.set(msg) catch unreachable;
+        std.debug.print("  [{d}] a={d} b=({d},{d}) c=\"{s}\"\n", .{
+            beat,
+            resources.res_a,
+            resources.res_b.x,
+            resources.res_b.y,
+            resources.res_c.slice(),
+        });
+
+        // Sleep long enough to be unmissable, short enough to stop.
+        sleep_ms(2_000);
     }
 }
 
-/// Look a priority up in the build-time table — demonstrates that the baked
-/// analysis is real data, not a hard-coded duplicate of the config.
-fn priorityOf(id: []const u8) u8 {
-    for (analysis.tasks) |task| {
-        if (std.mem.eql(u8, task.task_id, id)) return task.priority;
-    }
-    unreachable; // the glue comptime-checks that handlers match the config
-}
+/// The longest message idle can produce: "beat " + 20 digits of
+/// usize + NUL, rounded up, under the label's capacity of 32.
+const beat_msg_len: usize = 5 + 20 + 1;
 
-fn sleepMs(ms: u64) void {
-    const ts = std.c.timespec{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-    };
+/// Host stand-in for a `WFI`.
+fn sleep_ms(ms: u64) void {
+    const ts = std.posix.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast(ms % 1000 * 1_000_000) };
     _ = std.c.nanosleep(&ts, null);
 }
