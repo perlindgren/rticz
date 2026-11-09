@@ -1,0 +1,14 @@
+[
+  {
+    "task_id": "t0",
+    "interrupt_id": "TIMER0",
+    "priority": 1,
+    "resources": ["res_a", "res_b"]
+  },
+  {
+    "task_id": "t1",
+    "interrupt_id": "TIMER1",
+    "priority": 2,
+    "resources": ["res_b", "res_c"]
+  }
+]

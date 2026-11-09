@@ -1,0 +1,22 @@
+# Zig build-system cache: build graph, compiler intermediates, codegen
+# scratch. Everything in here is content-hash keyed and fully regenerated
+# by `zig build`, so it is never worth committing.
+.zig-cache/
+zig-cache/
+
+# Install prefix written by `zig build` / `zig build install`
+# (zig-out/bin/rticz, zig-out/bin/rticz-cli). Regenerate instead of commit.
+zig-out/
+
+# Local package cache populated by `zig fetch` (older workflow; harmless
+# to keep listed for projects that grow dependencies).
+.deps/
+
+# Editor / OS cruft.
+*.swp
+*~
+.DS_Store
+
+# Note: src/generated/analysis.zig and src/generated/rtic_glue.zig are
+# emitted by `zig build` on purpose — they live in the tree so they can be
+# read, reviewed, and versioned. They are deliberately NOT ignored.
