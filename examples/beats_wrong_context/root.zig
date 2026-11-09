@@ -1,18 +1,22 @@
 //! INTENTIONALLY BROKEN — a copy of ../beats/root.zig with ONE edit,
 //! marked `THE BUG` below.  Run `zig build` in this folder and read
 //! README.md beside this file.
-//! The application.  Everything lives in one file: resources as
-//! plain declarations, the task handlers, and ONE `config` — the
-//! system definition that is the file's only statement of what the
-//! system is.  init and idle are referenced functions; each
-//! interrupt task is a row that *names* its handler — RTIC's rule
-//! that a task and its handler share one name — beside its interrupt
-//! line, priority, and resource accesses.  The glue reads `config`,
-//! derives the resource ceilings and the task table from it at
-//! compile time, and prints the report in `main`.  Nothing is parsed.
+//! The application.  Everything lives in one file: the task handlers,
+//! and ONE `config` — the system definition that is the file's only
+//! statement of what the system is.  Resources are *declared* inside
+//! that config — name, type, initializer — and the instances
+//! themselves are emitted into a generated storage module this file
+//! cannot import: shared state is reachable here only through the
+//! contexts, never by name.  init and idle are referenced functions;
+//! each interrupt task is a row that *names* its handler — RTIC's
+//! rule that a task and its handler share one name — beside its
+//! interrupt line, priority, and the names of the resources it
+//! accesses.  The glue reads `config`, derives the resource ceilings
+//! and the task table from it at compile time, and prints the report
+//! in `main`.  Nothing is parsed.
 //! And even RTIC's per-task context structs are never handwritten:
 //! the code generator reads `config` and *emits* one context struct
-//! per task into `src/generated/context.zig`, imported as `context`
+//! per task into `generated/context.zig`, imported as `context`
 //! below — a handler's signature simply names `context.t0`, and
 //! nothing else in this file mentions contexts at all.  (Named after
 //! the task — RTIC's `Context<T0>` for task `t0`.  The generator
@@ -27,9 +31,13 @@
 //! `context.idle`, from its config row, and the glue enters idle
 //! with the generated `makeIdleCtx`.
 //!
-//! Two modules are generated, both from what you see below, both in
-//! src/generated/ — visible, regenerated every build:
+//! Three modules are generated, all from what you see below, all in
+//! generated/ — visible, regenerated every build:
 //!
+//! *   `storage.zig` — one `pub var` per resource, from the
+//!     declarations in `config.resources`; wired to the generated
+//!     modules only, so *this file cannot import it* — the resources
+//!     exist beyond the application's reach by module graph;
 //! *   `context.zig` — the per-task context structs, from
 //!     `config` (codegen/generate.zig);
 //! *   `irq.zig` — one trampoline per `interrupt_id`, which builds
@@ -47,30 +55,37 @@ const rticz = @import("rticz");
 
 // The per-task contexts: a module emitted by codegen/generate.zig
 // from `config` below, before this file is ever compiled.  The
-// import is a deliberate cycle — the contexts import "app" to reach
-// the resource declarations they point into, and the app imports
-// "context" to name them — and module cycles are fine to the
-// compiler: two views of one program.
+// import is a deliberate cycle — the contexts reach the resource
+// instances through the generated storage, the storage names the
+// application's types through "app", and the app imports "context"
+// to name the contexts — and module cycles are fine to the compiler:
+// views of one program.  What is *not* in this file is any import of
+// the storage module: the application has no edge to the instances,
+// which is what turns "only through the contexts" from a rule into a
+// fact.
 const context = @import("context");
 
-// The interrupt vector table: the other module emitted by
+// The interrupt vector table: another module emitted by
 // codegen/generate.zig from `config` below.  The same deliberate
 // cycle: the vectors import "app" to reach the handlers, and the app
-// imports "vectors" to call them.  Both generated files live at
-// src/generated/context.zig and src/generated/irq.zig — in the tree
-// for anyone to read, regenerated on every build.
+// imports "vectors" to call them.  The generated files live at
+// generated/storage.zig, context.zig and irq.zig — in the tree for
+// anyone to read, regenerated on every build.
 const vectors = @import("vectors");
 
 /// The system definition, one section: what the application is, in
 /// one literal.  The generators and the glue all read *this* —
-/// ceilings, contexts, vectors, banner — so there is nothing else to
-/// keep in sync.  An interrupt task row names its handler (the name
-/// is the reference: RTIC's rule, checked by the code generator
-/// against this file's declarations, and turned into the generated
-/// trampoline's typed call) and lists its resources as name-`&`-the-
-/// instance pairs, so the *declaration* is where names are claimed,
-/// for the analysis, the generated contexts, and the generated
-/// trampolines alike.
+/// ceilings, storage, contexts, vectors, banner — so there is nothing
+/// else to keep in sync.  It starts with the resources themselves:
+/// `decls` names each one and `of` spells its type and initializer —
+/// the declaration is where a resource exists, and the code
+/// generator copies it into the storage module.  An interrupt task
+/// row names its handler (the name is the reference: RTIC's rule,
+/// checked by the code generator against this file's declarations,
+/// and turned into the generated trampoline's typed call) and lists
+/// the names of the resources it accesses, so the *declaration* is
+/// what everything else names into: the analysis, the generated
+/// storage, the contexts, the trampolines.
 ///
 /// init and idle, by contrast, are references, not names: an app may
 /// hold any number of `fn () void`s, and only a reference says which.
@@ -85,10 +100,15 @@ const vectors = @import("vectors");
 /// is a choice — the resources it touches — and the code generator
 /// emits `context.idle` from that same row.
 pub const config: rticz.Config(context.idle) = .{
+    .resources = rticz.resource.decls(.{
+        .res_a = rticz.resource.of(u64, 0),
+        .res_b = rticz.resource.of(Position, .{}),
+        .res_c = rticz.resource.of(Label, Label.init("rticz")),
+    }),
     .init = init,
     .idle = .{
         .task_id = idle,
-        .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b, .res_c = &res_c }),
+        .resources = &.{ "res_a", "res_b", "res_c" },
     },
     // `&.{ … }`: the field is a slice, so the rows live in a constant
     // array the slice points into — Zig needs to know where they are.
@@ -97,13 +117,13 @@ pub const config: rticz.Config(context.idle) = .{
             .name = "t0",
             .interrupt_id = "TIMER0",
             .priority = 1,
-            .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b }),
+            .resources = &.{ "res_a", "res_b" },
         },
         .{
             .name = "t1",
             .interrupt_id = "UART0",
             .priority = 2,
-            .resources = rticz.resource.refs(.{ .res_b = &res_b, .res_c = &res_c }),
+            .resources = &.{ "res_b", "res_c" },
         },
     },
 };
@@ -201,7 +221,7 @@ pub inline fn priorityOf(comptime handler: anytype) u8 {
     @compileError("handler is not declared in config");
 }
 
-// ── Resources ───────────────────────────────────────────────────────
+// ── Types the resources are spelled with ────────────────────────────
 
 /// A 2-D point — a resource with structure.
 pub const Position = struct {
@@ -214,33 +234,32 @@ pub const Position = struct {
 /// parameter.
 pub const Label = rticz.text.BoundedString(32);
 
-// Each resource is its own declaration — not a field of one shared
-// store — because a resource's *placement* is its own business:
-// `align` and `linksection` are per-declaration, so any one of these
-// can land in its own memory region (a peripheral register block,
-// DMA-reachable RAM, battery-backed backup registers) without
-// dragging its neighbours along.  The declarations below carry
-// nothing but their defaults; placement, when an app needs it, is
-// written right here, e.g.
-//
-//     pub var res_b: Position align(8) linksection(".ccmram") = .{};
-
-/// Plain counter — `res_a` in the sample system.
-pub var res_a: u64 = 0;
-
-/// Struct resource — `res_b` in the sample system.
-pub var res_b: Position = .{};
-
-/// Bounded-string resource — `res_c` in the sample system.
-pub var res_c: Label = Label.init("rticz");
+// There are no resource *declarations* in this file — that is the
+// point.  A resource is declared once, inside `config.resources`,
+// and the code generator emits the instance into `generated/
+// storage.zig`, a module this file cannot import.  A resource's
+// *placement* — `align`, `linksection`, so one resource can land in
+// its own memory region (a peripheral register block, DMA-reachable
+// RAM, battery-backed backup registers) — is therefore a fact about
+// the generated declaration; the storage module is emitted from the
+// same single declaration, so placement will ride along with it the
+// day the declaration carries it, without this file or any handler
+// changing.  Meanwhile `init` cannot so much as read a resource: the
+// storage module is invisible to this file, so shared state lives
+// only behind a context — startup included.
 
 // ── Entry points ────────────────────────────────────────────────────
 
 /// Application startup: runs before the scheduler enables interrupts,
-/// so no task can be racing it.
+/// so no task can be racing it.  It prints what a handler knows about
+/// itself; it does *not* print `res_c`'s initial value, the way this
+/// example used to — since the storage module exists, `res_c` is not
+/// a name this file can speak, which is the wall working as
+/// intended.  (Real RTIC hands init a context of its own; giving this
+/// framework's init one is TODO.md work, and would make the value
+/// reportable again — through a claim.)
 pub fn init() void {
-    std.debug.print("application init: res_c = \"{s}\", priorityOf(t1) = {d}\n", .{
-        res_c.slice(),
+    std.debug.print("application init: priorityOf(t1) = {d}\n", .{
         comptime priorityOf(&t1),
     });
 }

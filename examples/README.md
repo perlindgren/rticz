@@ -13,10 +13,13 @@ zig build analyze      # the compile-time ceiling analysis, as text
 ```
 
 Your own application is this same shape: a `pub const config` in
-`root.zig`, resources as plain `pub var`s, handlers as `pub fn`s
-taking their context.
+`root.zig` — resources declared inside it, tasks as rows naming their
+handlers — handlers as `pub fn`s taking their context.  The resource
+*instances* are generated into `generated/storage.zig`, a module the
+application cannot import: shared state is reachable only through the
+contexts.
 
-## The four failures — copies of `beats` with one bug each
+## The five failures — copies of `beats` with one bug each
 
 Each folder below is a byte-identical copy of `beats` except for
 **one marked line** (`THE BUG`) in `root.zig`, and a README showing
@@ -27,6 +30,7 @@ where each class of mistake is caught:
 |---|---|---|
 | `beats_missing_handler/` | a row names a function that isn't there | the code generator, before anything compiles |
 | `beats_private_init/` | `config.init` points at a non-public function | the same text check |
+| `beats_direct_write/` | a bare write to a resource, as if the app owned it | the app-text lint, before anything compiles |
 | `beats_wrong_context/` | a handler takes the wrong task's context | Zig's type checker, at the generated trampoline |
 | `beats_nested_claim/` | a claim nested inside its own section | the claim guard at run time (compiles — no static check can decide it) |
 

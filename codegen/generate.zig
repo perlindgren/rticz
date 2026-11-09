@@ -1,5 +1,5 @@
-//! The code generator: contexts and interrupt vectors, from the app's
-//! source text.
+//! The code generator: storage, contexts and interrupt vectors, from
+//! the app's source text.
 //!
 //! RTIC hands each task a *context* — a struct with one field per
 //! accessed resource, so shared state is reached only through what the

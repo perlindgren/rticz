@@ -19,10 +19,10 @@ in the *types*, and Zig's own type checker rejects the program, at
 the generated trampoline that must call the handler:
 
 ```
-generated/irq.zig:37:12: error: expected type '*context.t1', found '*context.t0'
+generated/irq.zig:38:12: error: expected type '*context.t1', found '*context.t0'
     app.t0(&ctx);
            ^~~~
-root.zig:142:9: error: no field named 'res_a' in struct 'context.t1'
+root.zig:161:9: error: no field named 'res_a' in struct 'context.t1'
     ctx.res_a.claim(add_n, 1);
 ```
 

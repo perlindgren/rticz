@@ -38,6 +38,11 @@
 //! into this package's generated/ folder (git-ignored, but in the tree
 //! for anyone to read, rewritten on every build):
 //!
+//!   * `storage.zig` — one `pub var` per resource, emitted from the
+//!     declarations in `config.resources`.  This module is wired to
+//!     the generated modules only — never to the app — so the
+//!     application cannot import it, and the resource instances are
+//!     out of its reach by module graph, not by convention.
 //!   * `context.zig` — RTIC's per-task context structs, one per task,
 //!     named after it (`context.t0`, RTIC's `Context<T0>`), plus
 //!     `context.idle` and the `makeIdleCtx` constructor the glue uses
@@ -49,11 +54,12 @@
 //! imports the files it writes — is broken by *not compiling the app
 //! to read it*: generate.zig reads the single `pub const config`
 //! literal with `std.zig.Ast`, the very parser the compiler uses, so
-//! the config may reference handlers and resource addresses freely —
-//! to a reader of text, a reference is a name, and every name is
-//! checked against the declarations of the same file (a task row must
-//! name a `pub fn`, a resource access a declared variable; a missing
-//! name is the generator's error, before anything is written).  Real
+//! the config may reference handlers and spell resource declarations
+//! freely — to a reader of text, a reference is a name, and every name
+//! is checked against the declarations of the same file (a task row
+//! must name a `pub fn`, a resource access must name a declared
+//! resource; a missing name is the generator's error, before anything
+//! is written).  Real
 //! RTIC works exactly this way: its `#[app]` macro reads token
 //! streams, not compiled code.
 //!
@@ -101,19 +107,26 @@ pub fn build(b: *std.Build) void {
     const gen_code = b.addRunArtifact(generate_exe);
     gen_code.setName("gen-code");
     gen_code.addArg("root.zig");
+    gen_code.addArg("generated/storage.zig");
     gen_code.addArg("generated/context.zig");
     gen_code.addArg("generated/irq.zig");
 
-    // The application root plus both real modules — the generated
-    // modules import "app" to reach the declarations they name, and
-    // the app imports them to name its contexts and call its vectors:
-    // module cycles, so the pairs are created first and tied together
-    // after.
+    // The application root plus the three generated modules.  The
+    // storage module imports "app" to reach the application's types;
+    // the contexts and vectors import "storage" to reach the
+    // instances.  The application imports "context" and "vectors" —
+    // but *not* "storage": that edge does not exist, and it is the
+    // wall.  Module cycles (app→vectors→context→storage→app) are
+    // legal to the compiler: several views of one program.
     const app_mod = b.createModule(.{
         .root_source_file = b.path("root.zig"),
         .target = target,
         .imports = &.{.{ .name = "rticz", .module = rticz_mod }},
         .link_libc = true, // idle's sleep stands in for a WFI with libc's nanosleep
+    });
+    const storage_mod = b.createModule(.{
+        .root_source_file = b.path("generated/storage.zig"),
+        .target = target,
     });
     const vectors_mod = b.createModule(.{
         .root_source_file = b.path("generated/irq.zig"),
@@ -123,10 +136,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("generated/context.zig"),
         .target = target,
     });
+    storage_mod.addImport("app", app_mod); // types and initializers name the app
     vectors_mod.addImport("app", app_mod);
     vectors_mod.addImport("context", contexts_mod); // trampolines name their context type
     vectors_mod.addImport("rticz", rticz_mod); // the generated binding table's rows are `rticz.resource.Task`
-    contexts_mod.addImport("app", app_mod);
+    vectors_mod.addImport("storage", storage_mod); // trampolines fill proxies with instance addresses
+    contexts_mod.addImport("storage", storage_mod); // @TypeOf over the instances
     contexts_mod.addImport("rticz", rticz_mod); // its fields are `Claim` proxies carrying name + ceiling
     app_mod.addImport("vectors", vectors_mod);
     app_mod.addImport("context", contexts_mod);

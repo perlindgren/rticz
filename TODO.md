@@ -33,20 +33,28 @@ resume it.  Ordered by "would do next", not by size.
 ## Enforcement of the claim protocol
 
 The three raw-access holes are documented in `src/resource.zig`
-(*What this does not prevent*); none of the tiers is built, all were
-declined on 2026-11-09, not forgotten:
+(*What this does not prevent*).  As of 2026-11-10 two tiers are
+built and the hole count reflects it:
 
-- [ ] Tier A — generator lint: a resource's name may appear only in
-      its declaration and in config rows; reject `.ptr` reads in app
-      source text.  ~40 lines in the codegen era's text reader.
-- [ ] Tier B — language wall: move resource storage into a generated
-      module the application cannot `@import` (probed: `@import`
-      follows only build-graph edges, so the wall is real).  Needs
-      resources declared inside the config; the library split (done)
-      removed its last blocker.
+- [x] Tier B — language wall (built): resource storage is a generated
+      module (`generated/storage.zig`) wired only to the generated
+      contexts/vectors, so the application has no edge to it.  Both
+      escape paths verified refused by the compiler on 0.17.1:
+      `@import("storage")` → *no module named 'storage' available
+      within module 'app'*; `@import("generated/storage.zig")` →
+      *file exists in modules 'app' and 'storage'*.
+- [x] Tier A — generator lint (built, the light form):
+      `codegen/lint.zig` walks the app's import closure and rejects a
+      bare resource name, a proxy `.ptr` read, and an import of
+      generated code — all at generate time, `file:line:column`, with
+      the cure in the message.  Known limit: text-level, so a
+      comptime-built `@import(name)` is unseen — harmless for the
+      wall (no edge to hide), cosmetic for the other two rules.
 - [ ] Tier C — checked capability: replace the lent `*T` with a
-      wrapper that self-destructs, closing the stashed-pointer hole.
-      Cannot intercept methods; pairs with Tier A, not alone.
+      wrapper that self-destructs, closing the stashed-pointer hole —
+      the one that survives both built tiers (a reference captured
+      inside a section outlives the claim).
+      Cannot intercept methods; pairs with the lint, not alone.
 
 ## Zig-upstream watch — re-probe on every toolchain upgrade
 
