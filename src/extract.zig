@@ -4,29 +4,35 @@
 //! table: the linker drops a function whose *name* is the vector's
 //! name — `TIMER0`, `UART0` — into the table, and the core calls it
 //! when the line fires.  Nothing about that placement is expressible
-//! in the Zig compiler proper, so it is the one piece of the system
-//! that genuinely needs codegen: this tool emits, per config task, a
-//! trampoline named after the task's `interrupt_id` that *creates
-//! the task's context* — one field per accessed resource, naming the
-//! very instances the config declares — and calls the handler with
-//! it.
+//! in the Zig compiler proper, so it is the piece of the system that
+//! genuinely needs codegen beyond the contexts: this tool emits, per
+//! config task, a trampoline named after the task's `interrupt_id`
+//! that *creates the task's context* — one field per accessed
+//! resource, referencing the very declarations the task claimed —
+//! and calls the handler with it.
 //!
 //! The chicken-and-egg this creates, and how it is broken:
 //!
 //! *   the generator must read the task list of the application, so
 //!     it imports the app module and *compiles* it;
+//! *   reading the task list materializes the handler references,
+//!     which forces the handlers' analysis, which names their context
+//!     types — so this pass needs the real contexts, and runs after
+//!     src/gen_context.zig wrote them;
 //! *   but the application imports the vectors that this tool writes,
-//!     so it cannot compile against its real vectors before they exist.
+//!     so it cannot compile against its real vectors before they
+//!     exist.
 //!
-//! build.zig breaks the cycle by wiring the generator's copy of the app
-//! against the committed stub src/vectors_stub.zig instead of the real
-//! vectors.  The stub is honest for this tool because it reads
-//! `app.tasks`, never `app.config`: materializing the full config
-//! materializes idle's address too, and idle's body names the vectors —
-//! the compiler would analyze it against the stub and rightly reject
-//! it.  The task list materializes only the handlers, whose bodies
-//! mention no vectors at all (their comptime self-lookup goes through
-//! the hoisted task list for exactly this reason).
+//! build.zig breaks the cycle by wiring the generator's copy of the
+//! app against the committed stub src/vectors_stub.zig instead of the
+//! real vectors, and against the freshly generated contexts.  The
+//! stub is honest for this tool because it reads `app.tasks`, never
+//! `app.config`: materializing the full config materializes idle's
+//! address too, and idle's body names the vectors — the compiler
+//! would analyze it against the stub and rightly reject it.  The task
+//! list materializes only the handlers, whose bodies mention no
+//! vectors at all (their comptime self-lookup goes through the
+//! hoisted task list for exactly this reason).
 //!
 //! The real vectors are written into the tree at
 //! src/generated/irq.zig — git-ignored, but visible, so anyone can
@@ -55,6 +61,10 @@ const header =
     \\//! On real hardware these names are the symbols the linker places
     \\//! in the vector table; on the host they are plain functions the
     \\//! idle task calls in place of firing the interrupt line.
+    \\//! Each one builds its interrupt's context struct — from the
+    \\//! sibling generated module, src/generated/context.zig — and
+    \\//! calls the handler with it: the call type-checks the task's
+    \\//! whole declaration, handler signature included.
     \\
     \\
     \\const app = @import("app");
@@ -119,23 +129,21 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
 
-        // The context literal's fields: the store names behind the
-        // task's access list, resolved by the very identity walk that
-        // built the handler's own context type (`Ctx`) — so the
-        // literal the hardware entry point constructs is checked,
-        // field for field and type for type, against what the handler
-        // declares it receives.  This line is where the erased
-        // `task_id` reference gets its type checked.
-        const res_names = comptime rticz.resource.resourceNames(&app.resources, task.resources);
-
+        // The context literal's fields: the names the task claimed,
+        // carried by its access list — the same list src/gen_context.zig
+        // emitted the handler's context struct from, so the literal
+        // this hardware entry point constructs is checked, field for
+        // field and type for type, against what the handler declares
+        // it receives.  This line is where the erased `task_id`
+        // reference gets its type checked.
         try w.print("/// interrupt {s} → task {s} (ctx: ", .{ task.interrupt_id, handler_name });
-        for (res_names, 0..) |res_name, j| {
-            try w.print("{s}{s}", .{ if (j != 0) ", " else "", res_name });
+        for (task.resources, 0..) |res, j| {
+            try w.print("{s}{s}", .{ if (j != 0) ", " else "", res.name });
         }
         try w.print(")\n", .{});
         try w.print("pub fn {s}() void {{ app.{s}(.{{", .{ task.interrupt_id, handler_name });
-        for (res_names, 0..) |res_name, j| {
-            try w.print("{s} .{s} = &app.resources.{s}", .{ if (j != 0) "," else "", res_name, res_name });
+        for (task.resources, 0..) |res, j| {
+            try w.print("{s} .{s} = &app.{s}", .{ if (j != 0) "," else "", res.name, res.name });
         }
         try w.print(" }}); }}\n\n", .{});
     }

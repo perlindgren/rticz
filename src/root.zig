@@ -1,60 +1,88 @@
-//! The application.  Everything lives in one file: typed resources,
-//! the task handlers, and the system definition `config` that ties
-//! them together by reference — init, idle, and the interrupt tasks
-//! are all just functions referenced by name.
+//! The application.  Everything lives in one file: resources as
+//! plain declarations, the task handlers, and the system definition
+//! that ties them together by reference — init, idle, and the
+//! interrupt tasks are all just functions referenced by name.
 //!
-//! `config` is the single source of truth: the glue layer reads it,
-//! derives the resource ceilings and the task table from it at
-//! compile time, and prints the report in `main`.  Nothing is parsed,
-//! and the Zig compiler *is* the generator — for all but one thing.
-//! Even RTIC's per-task context structs are its work: `Ctx` builds
-//! each one from the task's declared accesses (see `t0_ctx`).  What
-//! remains for codegen is the interrupt vector table: on hardware a
-//! task is reached through a function whose name is the vector's
-//! name, and no amount of comptime reflection places symbols in a
-//! vector table, so exactly one module is generated from this app:
-//! one trampoline per `interrupt_id` — which creates the task's
-//! context instance and calls its handler — by src/extract.zig,
-//! imported as `vectors` below.
+//! `task_specs` and `config` are the single source of truth: the
+//! glue layer reads them, derives the resource ceilings and the task
+//! table from them at compile time, and prints the report in `main`.
+//! Nothing is parsed.  And even RTIC's per-task context structs are
+//! never handwritten: `src/gen_context.zig` reads `task_specs` and
+//! *emits* one context struct per interrupt into
+//! `src/generated/context.zig`, imported as `context` below — a
+//! handler's signature simply names `context.TIMER0`, and nothing
+//! else in this file mentions contexts at all.  (Named after the
+//! interrupt, not the handler: the generator runs from the
+//! handler-free declaration precisely so that no handler needs to
+//! compile before its own context exists.)
 //!
-//! Handlers are plain file-scope functions taking their context, so a
-//! config entry is simply `.task_id = &t0`.  A handler may as well
-//! come from another file — `const t0 = @import("irq.zig").t0;` — an
-//! imported alias is just as addressable.
+//! Two modules are generated, both from what you see below, both in
+//! src/generated/ — visible, regenerated every build:
+//!
+//! *   `context.zig` — the per-task context structs, from
+//!     `task_specs` (src/gen_context.zig);
+//! *   `irq.zig` — one trampoline per `interrupt_id`, which builds
+//!     the context struct and calls its handler (src/extract.zig);
+//!     on hardware these names are the vector-table symbols.
+//!
+//! Handlers are plain file-scope functions taking their context, so
+//! a handler may as well come from another file —
+//! `const t0 = @import("irq.zig").t0;` — an imported alias is just
+//! as addressable.
 
 const std = @import("std");
 const rticz = @import("rticz");
 
+// The per-task contexts: a module emitted by src/gen_context.zig
+// from `task_specs` below, during the build.  The import is a
+// deliberate cycle — the contexts import "app" to reach the resource
+// declarations they point into, and the app imports "context" to
+// name them — and module cycles are fine to the compiler: two views
+// of one program.
+const context = @import("context");
+
 // The interrupt vector table: a module emitted by src/extract.zig
-// from the task list below, during the build.  The import is a
-// deliberate cycle — the vectors import "app" to reach the handlers,
-// and the app imports "vectors" to call them — and module cycles are
-// fine to the compiler: two views of one program, one `resources`
-// behind both.  build.zig supplies the module: while generating, the
-// app is compiled against src/vectors_stub.zig; what ships links the
-// generated file, src/generated/irq.zig — in the tree for anyone to
-// read, regenerated on every build.
+// from the task list below, during the build.  The same deliberate
+// cycle: the vectors import "app" to reach the handlers, and the app
+// imports "vectors" to call them.  build.zig supplies both modules:
+// while generating, the app is compiled against the committed stubs
+// src/context_stub.zig and src/vectors_stub.zig; what ships links
+// the generated files, src/generated/context.zig and
+// src/generated/irq.zig — in the tree for anyone to read,
+// regenerated on every build.
 const vectors = @import("vectors");
 
-/// The interrupt tasks, hoisted out of the config literal so the
-/// vector generator can read the list without touching the rest of
-/// `config`: materializing the full config would materialize idle's
-/// address, and idle's body calls the very vectors the generator is
-/// writing — a cycle the build resolves by generating first.
-pub const tasks: []const rticz.ResourceTask = &.{
+/// The task declarations, handler-free by design: interrupt line,
+/// priority, and the resources the task accesses — each access a
+/// name-`&`-the-instance pair, so the *declaration* is where names
+/// are claimed, for the analysis, the generated contexts, and the
+/// generated trampolines alike.  The generators read only this list
+/// (never `config`): no handler must compile before the context its
+/// signature names exists, and reading a handler-free list forces no
+/// handler's analysis.
+pub const task_specs = [_]rticz.resource.TaskSpec{
     .{
-        .task_id = &t0,
         .interrupt_id = "TIMER0",
         .priority = 1,
-        .resources = t0_resources,
+        .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b }),
     },
     .{
-        .task_id = &t1,
         .interrupt_id = "UART0",
         .priority = 2,
-        .resources = t1_resources,
+        .resources = rticz.resource.refs(.{ .res_b = &res_b, .res_c = &res_c }),
     },
 };
+
+/// The interrupt tasks: the specs above, each bound to the handler
+/// that answers its interrupt, in order.  Hoisted out of the config
+/// literal so the vector generator can read the list without
+/// touching the rest of `config`: materializing the full config
+/// would materialize idle's address, and idle's body calls the very
+/// vectors the generator is writing — a cycle the build resolves by
+/// generating first.  A handler paired with the wrong spec cannot
+/// hide: the generated trampoline builds the spec's context literal,
+/// which must type-check against the handler's own signature.
+pub const tasks: []const rticz.ResourceTask = &rticz.resource.bindHandlers(.{ t0, t1 }, &task_specs);
 
 pub const config: rticz.ResourceConfig = .{
     // init and idle are tasks, so they are declared like tasks:
@@ -66,35 +94,15 @@ pub const config: rticz.ResourceConfig = .{
     .init = init,
     .idle = .{
         .task_id = idle,
-        .resources = &.{&resources.res_c},
+        .resources = rticz.resource.refs(.{ .res_c = &res_c }),
     },
 
     .tasks = tasks,
 };
 
-/// Each task's resource accesses, declared exactly once and used
-/// twice: they *are* the context the handler receives (below), and
-/// they are what the task table records for the analysis.  One list,
-/// two readers — the declaration and the proxy struct can never
-/// disagree.
-const t0_resources: []const *anyopaque = &.{ &resources.res_a, &resources.res_b };
-const t1_resources: []const *anyopaque = &.{ &resources.res_b, &resources.res_c };
-
-/// RTIC's task context, derived: one field per accessed resource,
-/// named as the store field, typed `*T` — the proxy over the very
-/// instance the config declares.  `Ctx` computes the struct at
-/// compile time from the list above; on real RTIC a codegen pass
-/// writes these structs out, but a type the compiler builds from the
-/// declaration is the same artifact with no chance of drift.  (What
-/// codegen genuinely owns is the *name* of the vector symbol — and
-/// the generated trampoline builds this struct, so the field names
-/// and types are checked exactly there.)
-pub const t0_ctx = rticz.resource.Ctx(&resources, t0_resources);
-pub const t1_ctx = rticz.resource.Ctx(&resources, t1_resources);
-
 /// The interrupt tasks arrive with their context: every access to
-/// shared state goes through a field of it, never through
-/// `resources` directly — which is exactly what makes the config's
+/// shared state goes through a field of it, never through the
+/// declarations directly — which is exactly what makes the task's
 /// resource list more than documentation.  The host build reaches
 /// handlers through the generated vector functions, which *create*
 /// the context instance — the same path the core takes on hardware,
@@ -104,7 +112,7 @@ pub const t1_ctx = rticz.resource.Ctx(&resources, t1_resources);
 /// application's visible surface: the framework resolves references by
 /// walking the module's *public* declarations, so `t0` and `t1` are
 /// `pub` — exactly what a name-based config could name across files.
-pub fn t0(ctx: t0_ctx) void {
+pub fn t0(ctx: context.TIMER0) void {
     ctx.res_a.* += 1;
     ctx.res_b.x += 1;
     // A handler can ask its own priority — from the config table, at
@@ -114,7 +122,7 @@ pub fn t0(ctx: t0_ctx) void {
     }
 }
 
-pub fn t1(ctx: t1_ctx) void {
+pub fn t1(ctx: context.UART0) void {
     ctx.res_b.y += 1;
     ctx.res_c.set("from t1") catch {};
 }
@@ -130,7 +138,7 @@ pub fn t1(ctx: t1_ctx) void {
 /// It reads the hoisted `tasks`, not `config.tasks`: a handler's
 /// comptime self-lookup would otherwise materialize the full config,
 /// idle included, wherever only the handler is needed — such as the
-/// vector generator's pass, which runs before idle's vectors exist.
+/// generator passes, which run before the things idle names exist.
 pub inline fn priorityOf(comptime handler: anytype) u8 {
     // Pointer identity, not `@intFromPtr`: a function's address is a
     // link-time fact, but identity is a comptime question — and the
@@ -155,19 +163,25 @@ pub const Position = struct {
 /// parameter.
 pub const Label = rticz.text.BoundedString(32);
 
-/// The application's shared state.  Each field is one resource; the
-/// analysis talks about them by address, so two fields of the same
-/// type are two distinct resources.
-pub const ResourceStore = struct {
-    /// Plain counter — `res_a` in the sample system.
-    res_a: u64 = 0,
-    /// Struct resource — `res_b` in the sample system.
-    res_b: Position = .{},
-    /// Bounded-string resource — `res_c` in the sample system.
-    res_c: Label = Label.init("rticz"),
-};
+// Each resource is its own declaration — not a field of one shared
+// store — because a resource's *placement* is its own business:
+// `align` and `linksection` are per-declaration, so any one of these
+// can land in its own memory region (a peripheral register block,
+// DMA-reachable RAM, battery-backed backup registers) without
+// dragging its neighbours along.  The declarations below carry
+// nothing but their defaults; placement, when an app needs it, is
+// written right here, e.g.
+//
+//     pub var res_b: Position align(8) linksection(".ccmram") = .{};
 
-pub var resources: ResourceStore = .{};
+/// Plain counter — `res_a` in the sample system.
+pub var res_a: u64 = 0;
+
+/// Struct resource — `res_b` in the sample system.
+pub var res_b: Position = .{};
+
+/// Bounded-string resource — `res_c` in the sample system.
+pub var res_c: Label = Label.init("rticz");
 
 // ── Entry points ────────────────────────────────────────────────────
 
@@ -175,7 +189,7 @@ pub var resources: ResourceStore = .{};
 /// so no task can be racing it.
 pub fn init() void {
     std.debug.print("application init: res_c = \"{s}\", priorityOf(t1) = {d}\n", .{
-        resources.res_c.slice(),
+        res_c.slice(),
         comptime priorityOf(&t1),
     });
 }
@@ -199,13 +213,13 @@ pub fn idle() noreturn {
         // overflow its buffer ("beat " + 20 digits ≤ 32 = capacity).
         var msg_buf: [beat_msg_len]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "beat {d}", .{beat}) catch unreachable;
-        resources.res_c.set(msg) catch unreachable;
+        res_c.set(msg) catch unreachable;
         std.debug.print("  [{d}] a={d} b=({d},{d}) c=\"{s}\"\n", .{
             beat,
-            resources.res_a,
-            resources.res_b.x,
-            resources.res_b.y,
-            resources.res_c.slice(),
+            res_a,
+            res_b.x,
+            res_b.y,
+            res_c.slice(),
         });
 
         // Sleep long enough to be unmissable, short enough to stop.

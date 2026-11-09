@@ -1,21 +1,30 @@
-//! The typed application side: resources as real Zig instances and
+//! The typed application side: resources as real Zig declarations and
 //! tasks referenced by their handler functions.
 //!
 //! The application writes its system definition in `src/root.zig`:
-//! `pub var resources` holds the storage instances, and `config` names
-//! the entry points by reference —
+//! each resource is its own `pub var` — placeable in its own linker
+//! section or alignment — and `task_specs` declares each interrupt
+//! task's line, priority and resource accesses, while `config` names
+//! the entry points by reference:
 //!
 //! ```zig
-//! .init = init,
-//! .idle = idle,
-//! .tasks = &.{.{ .task_id = t0, ... }},
+//! pub var res_a: u64 = 0;
+//!
+//! const task_specs = [_]rticz.resource.TaskSpec{
+//!     .{ .interrupt_id = "TIMER0", .priority = 1,
+//!        .resources = rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b }) },
+//! };
+//!
+//! .tasks = &rticz.resource.bindHandlers(.{ t0, t1 }, &task_specs),
 //! ```
 //!
-//! init and idle are tasks, so they are declared the same way as the
-//! interrupt tasks: a reference to the function, no invented name.
-//! Handlers are plain file-scope functions; one imported with
-//! `const t0 = @import("irq.zig").t0;` is just as addressable as one
-//! written here.  The glue layer resolves each function pointer back
+//! A resource access is a *named pair* (`ResourceRef`): the name and
+//! `&` of the same declaration, written together as one literal, so
+//! no analysis ever recovers a name by walking a namespace or
+//! comparing addresses — the name is written down exactly where it is
+//! claimed.  init and idle are tasks, so they are declared the same
+//! way as the interrupt tasks: a reference to the function, no
+//! invented name.  The glue layer resolves each function pointer back
 //! to its declared name by walking the application namespace and
 //! comparing addresses (`std.meta.eql` compares pointers to declared
 //! items at comptime), so the JSON analysis front end keeps seeing
@@ -23,7 +32,7 @@
 //! made of.
 //!
 //! Two Zig facts shape the implementation.  A `var` in the namespace
-//! cannot be read at comptime, so the walk asks only
+//! cannot be read at comptime, so the handler walk asks only
 //! `@TypeOf(@field(app, name))` — a type question that comptime can
 //! answer for `var`s, `const`s and functions alike — and evaluates
 //! `@field` only after the type test has skipped the non-fns.
@@ -32,14 +41,14 @@
 //! via `@field` is a self-dependency Zig rejects.  Hence
 //! `namedTasks` takes the application namespace from the outside.
 //!
-//! Task handlers take a per-task *context* (RTIC's `Context`): the
-//! `Ctx` type function derives that struct — one field per accessed
-//! resource, named by the store and typed `*T` over the instance —
-//! from the same address identity the analysis uses.  Handlers
-//! therefore no longer share a signature, which is why a task's
-//! `task_id` reference is an erased address: the config needs
-//! identity, and the generated trampoline's call is what checks the
-//! signature.
+//! Task handlers take a per-task *context* (RTIC's `Context`): a
+//! plain struct named after the interrupt, generated into
+//! `src/generated/context.zig` by `src/gen_context.zig` from the very
+//! `task_specs` declared here — one field per accessed resource,
+//! typed `*T` over the application's declaration.  Handlers therefore
+//! do not share a signature, which is why a task's `task_id`
+//! reference is an erased address: the config needs identity, and
+//! the generated trampoline's call is what checks the signature.
 
 const std = @import("std");
 
@@ -51,27 +60,109 @@ pub const Handler = *const fn () void;
 /// is referenced like every other task, not by name convention.
 pub const IdleHandler = *const fn () noreturn;
 
-/// One task in the application's system definition, as declared in
-/// `src/root.zig`.
+/// One claimed resource: its name, and the very instance it names.
+/// The pair is written as one atomic literal — `.res_a = &res_a` —
+/// so the name is never a label recovered from elsewhere: it is the
+/// declaration's own name at the place of the claim, and the pointer
+/// is that declaration's own storage.  `refs` produces these from
+/// the anonymous-struct literal an application writes; the analysis,
+/// the generated context structs, and the generated trampolines all
+/// read names straight from here — no reflection back through the
+/// application namespace, which comptime cannot do safely (a
+/// namespace holds consts whose evaluation would force handler
+/// analysis, exactly what the build's stub passes must not trigger).
+pub const ResourceRef = struct {
+    name: []const u8,
+    ptr: *anyopaque,
+    /// The declared type of what the name names — captured from the
+    /// reference itself, so the report can name the type of every
+    /// resource without ever reflecting back into the application.
+    type_name: []const u8,
+};
+
+/// Write the resource accesses of one task:
+///
+/// ```zig
+/// rticz.resource.refs(.{ .res_a = &res_a, .res_b = &res_b })
+/// ```
+///
+/// The field names become the context struct's fields and the
+/// analysis's vocabulary; the values must be references to the
+/// application's resource declarations.  The result is constant
+/// memory, safe to store in global task tables.
+pub fn refs(comptime named: anytype) []const ResourceRef {
+    // 0.17.1 struct reflection: field_names/field_types, no `.fields`.
+    const info = @typeInfo(@TypeOf(named)).@"struct";
+    const N = info.field_names.len;
+    var items: [N]ResourceRef = undefined;
+    inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
+        items[i] = .{
+            .name = field_name,
+            .ptr = @ptrCast(@field(named, field_name)),
+            // The field's own type is the reference `&name` wrote —
+            // a pointer; its child is the declared resource type.
+            .type_name = @typeName(@typeInfo(field_type).pointer.child),
+        };
+    }
+    // Freeze: a slice escaping this function must point into
+    // constant memory, and a comptime `var` does not qualify.
+    const Frozen = struct { items: [N]ResourceRef };
+    const frozen: Frozen = .{ .items = items };
+    return &frozen.items;
+}
+
+/// What one interrupt task declares, before any handler is attached:
+/// its interrupt line, its priority, and the resources it accesses.
+/// The application writes a list of these; it is the input the
+/// context generator reads.  It deliberately contains no function
+/// references: reading it must not force the analysis of any handler,
+/// because the generator that produces the handler contexts has to
+/// read the declaration *before* those handlers can compile — a
+/// handler's signature is going to *name* one of the very contexts
+/// the generator emits.
+pub const TaskSpec = struct {
+    interrupt_id: []const u8,
+    priority: u8,
+    resources: []const ResourceRef,
+};
+
+/// The complete declaration of one interrupt task: its spec (from the
+/// application's `task_specs`) and the handler that answers its
+/// interrupt.  The handler is held as an erased address because each
+/// handler takes its own context struct and therefore shares no
+/// signature; identity is what the system needs from the reference,
+/// and the generated trampoline's call checks the signature.
 pub const Task = struct {
-    /// The task *is* its handler: a reference to a function in the
-    /// application namespace.  Resolved to a name for the analysis.
-    /// The pointer is type-erased because handlers no longer share a
-    /// signature — each takes its own context struct (see `Ctx`) —
-    /// and all the config needs from the reference is *identity*,
-    /// which is what the address carries.  The signature is checked
-    /// where it matters: the generated trampoline calls the handler
-    /// with a context literal that must type-check against it.
     task_id: *const anyopaque,
     interrupt_id: []const u8,
     priority: u8,
-    /// Pointers to the resource instances this task accesses.  The
-    /// pointer target type is erased (`*anyopaque`) so a `&u64`, a
-    /// `*Position` and a `*BoundedString(32)` coexist in one list.
-    /// The address *is* the identity of a resource: `&resources.res_b`
-    /// names exactly one instance, whatever its type.
-    resources: []const *anyopaque,
+    resources: []const ResourceRef,
 };
+
+/// Attach handlers to specs, in order: entry `i` of `handlers`
+/// answers interrupt `i` of `specs`.  The application's `pub const
+/// tasks` is this one line, which is what keeps the two views of a
+/// task — the declaration the generator reads, the executable entry
+/// the analysis walks — from ever disagreeing.  A handler paired with
+/// the wrong spec fails at the trampoline: the context literal built
+/// from the spec's resources would not fit the context type the
+/// handler's signature demands.
+pub fn bindHandlers(comptime handlers: anytype, comptime specs: []const TaskSpec) [specs.len]Task {
+    const names = @typeInfo(@TypeOf(handlers)).@"struct".field_names;
+    if (names.len != specs.len) {
+        @compileError("bindHandlers: the handler list and the task spec list have different lengths");
+    }
+    var out: [specs.len]Task = undefined;
+    inline for (names, specs, 0..) |handler_name, spec, i| {
+        out[i] = .{
+            .task_id = @field(handlers, handler_name),
+            .interrupt_id = spec.interrupt_id,
+            .priority = spec.priority,
+            .resources = spec.resources,
+        };
+    }
+    return out;
+}
 
 /// The idle task, declared like a task — except that it has no
 /// interrupt (it *is* the fallback context) and no priority to
@@ -81,7 +172,7 @@ pub const Task = struct {
 /// task, is which resources it touches.
 pub const IdleTask = struct {
     task_id: IdleHandler,
-    resources: []const *anyopaque,
+    resources: []const ResourceRef,
 };
 
 /// The system definition: entry points and interrupt tasks, all as
@@ -107,12 +198,12 @@ pub const Config = struct {
 /// single signature to test for, and the trampoline call type-checks
 /// what the config referenced.
 ///
-/// The walk stays legal even when the namespace holds `var`s (like
-/// `resources`) that comptime may not evaluate: each declaration is
-/// first asked for its *type* — `@TypeOf(@field(...))` is a type
-/// question comptime can answer for `var`s, `const`s and functions
-/// alike — and `@field` is only evaluated once the type test has
-/// skipped the non-fns.
+/// The walk stays legal even when the namespace holds `var`s (the
+/// resource declarations themselves) that comptime may not evaluate:
+/// each declaration is first asked for its *type* —
+/// `@TypeOf(@field(...))` is a type question comptime can answer for
+/// `var`s, `const`s and functions alike — and `@field` is only
+/// evaluated once the type test has skipped the non-fns.
 pub fn handlerName(comptime handlers_ns: type, comptime handler: anytype) ?[]const u8 {
     // Identity by pointer equality, not integer addresses: a
     // function's address is a link-time fact, so `@intFromPtr` cannot
@@ -126,143 +217,71 @@ pub fn handlerName(comptime handlers_ns: type, comptime handler: anytype) ?[]con
     // that even to a comptime-evaluated function.
     inline for (@typeInfo(handlers_ns).@"struct".decl_names) |decl_name| {
         const name: []const u8 = decl_name;
-        // The app's contract surface — the system definition and the
-        // hoisted task list it embeds — is vocabulary, never a
-        // handler, and probing it is not merely wasted but wrong:
-        // reading a container-level const evaluates its value, and
-        // `config`'s value embeds idle's address, whose analysis
-        // names the interrupt vectors.  During the vector-generation
-        // pass the app compiles against the empty stub, and that
-        // analysis would (rightly) reject it.  Handlers are the
-        // application's *other* functions; these two names stay out
-        // of the walk.  (Shape is load-bearing: the guards must be
-        // short-circuit operands, not `if … continue` — comptime flow
-        // control inside a block that a runtime instantiation also
-        // sees is rejected, and this generic does get instantiated
-        // from runtime code.)
-        const is_contract = std.mem.eql(u8, name, "config") or std.mem.eql(u8, name, "tasks");
+        // The app's contract surface — the system definition, the
+        // hoisted task list it embeds, and the specs the task list is
+        // bound from — is vocabulary, never a handler, and probing it
+        // is not merely wasted but wrong: reading a container-level
+        // const evaluates its value, and `config`'s value embeds
+        // idle's address, whose analysis names the interrupt vectors
+        // and the generated contexts.  During the generator passes
+        // the app compiles against the stubs, and that analysis would
+        // (rightly) reject them.  Handlers are the application's
+        // *other* functions; these names stay out of the walk.
+        // (Shape is load-bearing: the guards must be short-circuit
+        // operands, not `if … continue` — comptime flow control
+        // inside a block that a runtime instantiation also sees is
+        // rejected, and this generic does get instantiated from
+        // runtime code.)
+        const is_contract = std.mem.eql(u8, name, "config") or
+            std.mem.eql(u8, name, "tasks") or
+            std.mem.eql(u8, name, "task_specs");
         if (!is_contract and @typeInfo(@TypeOf(@field(handlers_ns, name))) == .@"fn" and
             std.meta.eql(target, @as(*const anyopaque, &@field(handlers_ns, name)))) return name;
     }
     return null;
 }
 
-/// The field name of the store `store_ptr` points at whose instance
-/// `res_ptr` addresses — or null if the pointer addresses nothing in
-/// the store.  The address *is* the identity of a resource, so this
-/// is the question "which resource is this?" asked in the store's
-/// vocabulary.  Runs at comptime; takes the store by pointer because
-/// the store is a `var` whose value comptime may not evaluate, while
-/// the addresses of its fields are known.
-pub fn resourceName(comptime store_ptr: anytype, comptime res_ptr: *anyopaque) ?[]const u8 {
-    const store_info = @typeInfo(@typeInfo(@TypeOf(store_ptr)).pointer.child).@"struct";
-    inline for (store_info.field_names) |field_name| {
-        const candidate: *anyopaque = @ptrCast(&@field(store_ptr.*, field_name));
-        if (std.meta.eql(res_ptr, candidate)) return field_name;
-    }
-    return null;
-}
-
-/// The field names behind a whole access list, in order — the names a
-/// task context uses as field names, and the vector trampoline uses
-/// to build its context literal.  The result points into constant
-/// memory, so it may escape a comptime evaluation.
-pub fn resourceNames(comptime store_ptr: anytype, comptime accesses: []const *anyopaque) []const []const u8 {
-    var items: [accesses.len][]const u8 = undefined;
-    for (accesses, 0..) |res_ptr, i| {
-        items[i] = resourceName(store_ptr, res_ptr) orelse {
-            @compileError("a task references a resource that is not a field of the application resource store");
-        };
-    }
-    const Frozen = struct { names: [accesses.len][]const u8 };
-    const frozen: Frozen = .{ .names = items };
-    return &frozen.names;
-}
-
-/// The context type of a task: one public field per accessed resource
-/// — named exactly as the store field it reaches, typed `*T` over the
-/// instance.  This is the RTIC ctx struct; the bare pointer is the
-/// proxy for now, and ceiling-aware wrappers (an exclusive handle at
-/// the task's priority, a lock at a lower one) replace the field type
-/// without changing any of the code written against it.
-///
-/// The type is *derived*, not emitted into a file: it is computed by
-/// the compiler, from the task's access list, on every build — which
-/// is the codegen Zig can do itself, and does before any hand of
-/// codegen is possible: the handler signatures name these types, and
-/// the vector generator must compile the app *before* the vectors
-/// exist.  What genuinely needs codegen — a symbol named `TIMER0` —
-/// then builds an instance of this type and calls the handler with
-/// it, so the trampoline in `src/generated/irq.zig` is checked
-/// against this struct field-for-field, type-for-type.
-pub fn Ctx(comptime store_ptr: anytype, comptime accesses: []const *anyopaque) type {
-    const Store = @typeInfo(@TypeOf(store_ptr)).pointer.child;
-    var names: [accesses.len][]const u8 = undefined;
-    var types: [accesses.len]type = undefined;
-    var attrs: [accesses.len]std.builtin.Type.Struct.FieldAttributes = undefined;
-    for (accesses, 0..) |res_ptr, i| {
-        const name = resourceName(store_ptr, res_ptr) orelse {
-            @compileError("a task context reaches a resource that is not a field of the application resource store");
-        };
-        for (names[0..i]) |earlier| {
-            if (std.mem.eql(u8, earlier, name)) {
-                @compileError(std.fmt.comptimePrint(
-                    "a task context lists resource '{s}' twice; a context has one field per resource",
-                    .{name},
-                ));
-            }
-        }
-        names[i] = name;
-        types[i] = *@FieldType(Store, name);
-        attrs[i] = .{};
-    }
-    return @Struct(.auto, null, &names, &types, &attrs);
-}
-
 /// The analysis-facing task list of an application: the same tasks as
 /// `tasks`, with the handler function pointers resolved to their
-/// declared names and the resource pointers resolved to the field
-/// names of the resource store `store_ptr` points at — followed by
-/// the idle task, which is a task too (logical priority 0, the
-/// system's floor; it has no interrupt, so its row reads `none`).
-/// The ceiling analysis deliberately skips that last row: idle sits
-/// at the bottom of the scale and is preempted by every interrupt
-/// task, so its 0 can never be a ceiling.  But the row records what
-/// idle-context code touches — which is exactly where a ceiling will
-/// later have to be enforced.
+/// declared names — resource references carry their names directly,
+/// so nothing else needs resolving — followed by the idle task, which
+/// is a task too (logical priority 0, the system's floor; it has no
+/// interrupt, so its row reads `none`).  The ceiling analysis
+/// deliberately skips that last row: idle sits at the bottom of the
+/// scale and is preempted by every interrupt task, so its 0 can never
+/// be a ceiling.  But the row records what idle-context code touches
+/// — which is exactly where a ceiling will later have to be enforced.
 ///
 /// `handlers_ns` is the application namespace where the handlers are
-/// declared or imported; `store_ptr` is `&app.resources`.  Both are
-/// handed in by the glue layer, which walks the application from the
+/// declared or imported; the analysis walks the application from the
 /// outside — the analysis results cannot live in root itself (a
 /// `const` in root that reads root's declarations via `@field` is a
-/// self-dependency).
+/// self-dependency).  Resource names need no namespace at all: each
+/// reference states its own name.
 ///
 /// The whole thing runs at comptime, so a handler that is not a
-/// function of the namespace, a resource pointer that is not one of
-/// the store's fields, or a priority that claims idle's 0, stops the
-/// build with an error that quotes the task by name.
+/// function of the namespace, or a priority that claims idle's 0,
+/// stops the build with an error that quotes the task by name.
 pub fn namedTasks(
     comptime tasks: []const Task,
     comptime idle: IdleTask,
-    comptime store_ptr: anytype,
     comptime handlers_ns: type,
 ) []const parser.Task {
     const count = tasks.len + 1;
 
-    // One uniform view for the two passes: the interrupt tasks, then
+    // One uniform view for both passes: the interrupt tasks, then
     // idle — the only differences being idle's missing interrupt and
     // the fixed logical priority 0.
     const Entry = struct {
         name: []const u8,
         interrupt_id: []const u8,
         priority: u8,
-        resources: []const *anyopaque,
+        resources: []const ResourceRef,
     };
     var entries: [count]Entry = undefined;
 
     // Resolve every handler to its declared name first: the name is
-    // what error messages about the same task's resources quote.
+    // what error messages about the same task quote.
     for (tasks, 0..) |task, ti| {
         if (task.priority == 0) {
             @compileError("interrupt tasks start at priority 1; priority 0 is idle");
@@ -290,28 +309,21 @@ pub fn namedTasks(
         .resources = idle.resources,
     };
 
-    // Pass 2: resolve the resource pointers to store field names.
+    // Collect every resource name into one pool.  Slices that escape
+    // this function must point into constant memory, and a comptime
+    // `var` does not qualify — so the pool is first copied into a
+    // `const`, and only then are the slices taken from it.
     const cap = count * 8;
     var pool_items: [cap][]const u8 = undefined;
     var total: usize = 0;
 
-    for (entries, 0..) |entry, ti| {
-        for (entry.resources, 0..) |res_ptr, ri| {
-            pool_items[total + ri] = resourceName(store_ptr, res_ptr) orelse {
-                @compileError(std.fmt.comptimePrint(
-                    "task '{s}' references a resource that is not a field of " ++
-                        "the application resource store",
-                    .{entries[ti].name},
-                ));
-            };
+    for (entries) |entry| {
+        for (entry.resources, 0..) |res, ri| {
+            pool_items[total + ri] = res.name;
         }
         total += entry.resources.len;
     }
 
-    // Freeze the name pool.  Slices that escape this function must
-    // point into constant memory, and a comptime `var` does not
-    // qualify — so the pool is first copied into a `const`, and only
-    // then are the slices taken from it.
     const Pool = struct { items: [cap][]const u8 };
     const pool: Pool = .{ .items = pool_items };
 
@@ -352,13 +364,13 @@ const TestTasks = struct {
     pub var hidden_state: u64 = 0;
 };
 
-const TestStore = struct {
-    counter1: u64 = 0,
-    counter2: u64 = 0,
-    flag: bool = false,
+// An application-shaped namespace: resources as individual `pub var`
+// declarations, exactly as an app root declares them.
+const App = struct {
+    pub var counter1: u64 = 0;
+    pub var counter2: u64 = 0;
+    pub var flag: bool = false;
 };
-
-var test_store: TestStore = .{};
 
 test "references resolve to declared names, whatever the signature" {
     try std.testing.expectEqualStrings("alpha", handlerName(TestTasks, &TestTasks.alpha).?);
@@ -379,6 +391,39 @@ test "the system definition references init and idle by function too" {
     try std.testing.expectEqualStrings("forever", handlerName(TestTasks, system.idle.task_id).?);
 }
 
+test "a named access pair carries its own name and reaches its own storage" {
+    // `comptime`: refs' whole design — names from reflection, a slice
+    // frozen into constant memory — only exists in a comptime
+    // evaluation, and an application uses it in exactly one place:
+    // the `task_specs` table, a container-level const.
+    const claimed = comptime refs(.{ .counter1 = &App.counter1, .flag = &App.flag });
+    try std.testing.expectEqual(@as(usize, 2), claimed.len);
+    try std.testing.expectEqualStrings("counter1", claimed[0].name);
+    try std.testing.expectEqualStrings("flag", claimed[1].name);
+    // The pointer is the very declaration named — writes through it
+    // land on `App.counter1` itself.
+    const first: *u64 = @ptrCast(@alignCast(claimed[0].ptr));
+    first.* += 3;
+    try std.testing.expectEqual(@as(u64, 3), App.counter1);
+}
+
+test "bindHandlers attaches handlers to specs, in order" {
+    comptime {
+        const specs = [_]TaskSpec{
+            .{ .interrupt_id = "X", .priority = 1, .resources = refs(.{ .counter1 = &App.counter1 }) },
+            .{ .interrupt_id = "Y", .priority = 2, .resources = refs(.{ .counter2 = &App.counter2 }) },
+        };
+        const bound = bindHandlers(.{ TestTasks.alpha, TestTasks.beta }, &specs);
+        try std.testing.expectEqual(@as(usize, 2), bound.len);
+        try std.testing.expectEqualStrings("X", bound[0].interrupt_id);
+        try std.testing.expectEqual(@as(u8, 2), bound[1].priority);
+        try std.testing.expectEqualStrings("counter2", bound[1].resources[0].name);
+        // Identity survives erasure: the reference still *is* the handler.
+        try std.testing.expectEqualStrings("alpha", handlerName(TestTasks, bound[0].task_id).?);
+        try std.testing.expectEqualStrings("beta", handlerName(TestTasks, bound[1].task_id).?);
+    }
+}
+
 // The resolution runs at comptime — the escape of `&built.tasks` and
 // the error paths only exist in a comptime evaluation — so these
 // tests force one with `comptime { ... }`.
@@ -387,13 +432,20 @@ const no_idle: IdleTask = .{ .task_id = TestTasks.forever, .resources = &.{} };
 
 test "references name the storage instance, not the type" {
     comptime {
-        const tasks: []const Task = &.{
-            .{ .task_id = TestTasks.alpha, .interrupt_id = "X", .priority = 1, .resources = &.{
-                &test_store.counter1, &test_store.flag,
-            } },
-            .{ .task_id = TestTasks.beta, .interrupt_id = "Y", .priority = 2, .resources = &.{&test_store.counter2} },
+        const specs = [_]TaskSpec{
+            .{
+                .interrupt_id = "X",
+                .priority = 1,
+                .resources = refs(.{ .counter1 = &App.counter1, .flag = &App.flag }),
+            },
+            .{
+                .interrupt_id = "Y",
+                .priority = 2,
+                .resources = refs(.{ .counter2 = &App.counter2 }),
+            },
         };
-        const named = namedTasks(tasks, no_idle, &test_store, TestTasks);
+        const tasks: []const Task = &bindHandlers(.{ TestTasks.alpha, TestTasks.beta }, &specs);
+        const named = namedTasks(tasks, no_idle, TestTasks);
 
         try std.testing.expectEqualStrings("alpha", named[0].task_id);
         try std.testing.expectEqualStrings("X", named[0].interrupt_id);
@@ -409,14 +461,17 @@ test "references name the storage instance, not the type" {
 
 test "idle is a task in the resolved table, at logical priority 0" {
     comptime {
-        const tasks: []const Task = &.{
-            .{ .task_id = TestTasks.alpha, .interrupt_id = "X", .priority = 1, .resources = &.{} },
-        };
+        const specs = [_]TaskSpec{.{
+            .interrupt_id = "X",
+            .priority = 1,
+            .resources = &.{},
+        }};
+        const tasks: []const Task = &bindHandlers(.{TestTasks.alpha}, &specs);
         const idle: IdleTask = .{
             .task_id = TestTasks.forever,
-            .resources = &.{&test_store.counter1},
+            .resources = refs(.{ .counter1 = &App.counter1 }),
         };
-        const named = namedTasks(tasks, idle, &test_store, TestTasks);
+        const named = namedTasks(tasks, idle, TestTasks);
 
         try std.testing.expectEqual(@as(usize, 2), named.len); // the task, plus idle
         const row = named[named.len - 1];
@@ -429,11 +484,12 @@ test "idle is a task in the resolved table, at logical priority 0" {
 
 test "resolved names feed the ceiling analysis unchanged" {
     comptime {
-        const tasks: []const Task = &.{
-            .{ .task_id = TestTasks.alpha, .interrupt_id = "X", .priority = 1, .resources = &.{&test_store.counter1} },
-            .{ .task_id = TestTasks.beta, .interrupt_id = "Y", .priority = 2, .resources = &.{&test_store.counter1} },
+        const specs = [_]TaskSpec{
+            .{ .interrupt_id = "X", .priority = 1, .resources = refs(.{ .counter1 = &App.counter1 }) },
+            .{ .interrupt_id = "Y", .priority = 2, .resources = refs(.{ .counter1 = &App.counter1 }) },
         };
-        const named = namedTasks(tasks, no_idle, &test_store, TestTasks);
+        const tasks: []const Task = &bindHandlers(.{ TestTasks.alpha, TestTasks.beta }, &specs);
+        const named = namedTasks(tasks, no_idle, TestTasks);
         const ceilings = @import("ceiling.zig").computeAtComptime(named);
         try std.testing.expectEqual(@as(usize, 1), ceilings.len);
         try std.testing.expectEqualStrings("counter1", ceilings[0].name);
@@ -441,31 +497,12 @@ test "resolved names feed the ceiling analysis unchanged" {
     }
 }
 
-test "a task context names its accesses and holds a proxy over each" {
-    const C = Ctx(&test_store, &.{ &test_store.counter1, &test_store.flag });
-    const info = @typeInfo(C).@"struct";
-    try std.testing.expectEqual(@as(usize, 2), info.field_names.len);
-    try std.testing.expectEqualStrings("counter1", info.field_names[0]);
-    try std.testing.expectEqual(*u64, info.field_types[0]);
-    try std.testing.expectEqualStrings("flag", info.field_names[1]);
-    try std.testing.expectEqual(*bool, info.field_types[1]);
-}
-
-test "context fields reach the very storage instances they name" {
-    const C = Ctx(&test_store, &.{&test_store.counter1});
-    // `const` ctx: the struct itself is fixed; what mutates is the
-    // storage its proxy reaches — which is precisely the point.
-    const ctx: C = .{ .counter1 = &test_store.counter1 };
-    const before = test_store.counter1;
-    ctx.counter1.* += 5;
-    try std.testing.expectEqual(before + 5, test_store.counter1);
-}
-
 test "a handler taking its context is still found by address" {
-    const C = Ctx(&test_store, &.{&test_store.counter2});
-    // A handler of the new shape — it takes a context, not nothing.
+    // The new-world shape: the context is a plain struct named after
+    // the interrupt — exactly what src/generated/context.zig holds.
+    const CtxX = struct { counter2: *u64 };
     const Handlers = struct {
-        pub fn bump(ctx: C) void {
+        pub fn bump(ctx: CtxX) void {
             ctx.counter2.* += 1;
         }
     };

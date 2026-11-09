@@ -4,8 +4,9 @@
 //! This module is the entry point of the produced binary.  It reads
 //! `app.config` — the system definition from `src/root.zig` — and turns
 //! its *references* into names at compile time: handlers are matched
-//! against the application namespace by address, resource pointers
-//! against the fields of `app.resources`.  The resolution must happen
+//! against the application namespace by address; resource accesses
+//! carry their names where they are claimed, so there is nothing to
+//! match there.  The handler resolution must happen
 //! out here: a `const` in root that reads root's own declarations via
 //! `@field` is a self-dependency Zig rejects, so the framework walks
 //! the application, never the other way round.  The walk also checks
@@ -23,13 +24,12 @@ pub const tasks = app.config.tasks;
 
 /// The declared-name view of the config: same order as `tasks`, with
 /// handler references resolved to their names in the application
-/// namespace and resource pointers resolved to field names of
-/// `app.resources` — plus the idle task as the last row, at logical
-/// priority 0, because idle is a task too and its resource accesses
-/// are a fact about the system worth recording.  This is the input
-/// to the JSON-shaped analysis; the ceilings below use only the
-/// interrupt-task prefix of it.
-pub const named_tasks = rticz.resource.namedTasks(app.config.tasks, app.config.idle, &app.resources, app);
+/// namespace (resource accesses name themselves) — plus the idle task
+/// as the last row, at logical priority 0, because idle is a task too
+/// and its resource accesses are a fact about the system worth
+/// recording.  This is the input to the JSON-shaped analysis; the
+/// ceilings below use only the interrupt-task prefix of it.
+pub const named_tasks = rticz.resource.namedTasks(app.config.tasks, app.config.idle, app);
 
 /// Resource ceilings, derived from the config by the framework — the
 /// application never states them.  The ceiling is computed over the
@@ -137,14 +137,60 @@ fn printSystemDefinition() void {
         std.debug.print("    {s:>5} : ceiling={d}\n", .{ rc.name, rc.ceiling });
     }
 
-    const store_info = @typeInfo(@TypeOf(app.resources)).@"struct";
-    std.debug.print("  resources ({d}, declared types):\n", .{store_info.field_names.len});
-    inline for (store_info.field_names, store_info.field_types) |field_name, field_type| {
-        std.debug.print("    {s:>5} : {s}\n", .{ field_name, @typeName(field_type) });
+    std.debug.print("  resources ({d}, declared types):\n", .{resources.len});
+    for (resources) |res| {
+        std.debug.print("    {s:>5} : {s}\n", .{ res.name, res.type_name });
     }
 
     std.debug.print("  entry points: init={s}, idle={s} (referenced in config)\n", .{ init_name, idle_name });
 }
+
+/// A resource as the system declares it: its name and the declared
+/// type of the application's own instance.  Both facts are carried by
+/// the access references themselves — each was written as
+/// `.name = &name`, so name and type came straight from the
+/// declaration the task pointed at; nothing here reflects into the
+/// application to recover them.
+pub const ResourceInfo = struct {
+    name: []const u8,
+    type_name: []const u8,
+};
+
+/// Every resource any task claims, deduplicated, in first-claim
+/// order: the interrupt tasks as declared, then idle's own list.
+/// Built in a comptime const initializer, so the "runtime" loops
+/// below are compile-time evaluation; the walk reads the config's
+/// `ResourceRef`s directly, which carry name and type as written at
+/// the claim.  The table is frozen as a container-level `const`, and
+/// the public slice is taken from it — a slice escaping into a global
+/// must point into constant memory, and a comptime `var` does not
+/// qualify.
+const ResourceTable = struct { items: [64]ResourceInfo, len: usize };
+
+const resource_table: ResourceTable = blk: {
+    var rows: [64]ResourceInfo = undefined;
+    var count: usize = 0;
+    const all_lists = app.config.tasks.len + 1;
+    var li: usize = 0;
+    while (li < all_lists) : (li += 1) {
+        const list = if (li < app.config.tasks.len)
+            app.config.tasks[li].resources
+        else
+            app.config.idle.resources;
+        for (list) |res| {
+            var known = false;
+            for (rows[0..count]) |row| {
+                if (std.mem.eql(u8, row.name, res.name)) known = true;
+            }
+            if (known) continue;
+            rows[count] = .{ .name = res.name, .type_name = res.type_name };
+            count += 1;
+        }
+    }
+    break :blk .{ .items = rows, .len = count };
+};
+
+pub const resources: []const ResourceInfo = resource_table.items[0..resource_table.len];
 
 // ── Tests ───────────────────────────────────────────────────────────
 

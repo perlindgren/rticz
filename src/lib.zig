@@ -28,7 +28,8 @@ pub const ResourceTask = resource.Task;
 
 /// The required signature of the init handler: `fn() void` — it runs
 /// before contexts exist.  Interrupt task handlers take their own
-/// context struct instead (see `resource.Ctx`), so the task table
+/// context struct instead — a plain struct named after the interrupt,
+/// generated into src/generated/context.zig — so the task table
 /// references them by erased address.
 pub const Handler = resource.Handler;
 
