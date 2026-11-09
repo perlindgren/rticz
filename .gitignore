@@ -18,5 +18,6 @@ zig-out/
 .DS_Store
 
 # Note: src/generated/analysis.zig and src/generated/rtic_glue.zig are
-# emitted by `zig build` on purpose — they live in the tree so they can be
-# read, reviewed, and versioned. They are deliberately NOT ignored.
+# emitted by `zig build` 
+
+src/generated/
