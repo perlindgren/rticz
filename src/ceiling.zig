@@ -56,6 +56,65 @@ fn lessByName(_: void, a: ResourceCeiling, b: ResourceCeiling) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
+/// Compile-time counterpart of `compute`: the same sorted ceiling table,
+/// derived inside the compiler — no allocator, no parser, no codegen step.
+/// The `tasks` parameter is `comptime`, so callers pass their const task
+/// table and the result is a compile-time constant; call it from a `const`
+/// initializer or `comptime` block (runtime call sites should read such a
+/// constant instead — see `app.ceilings` / `glue.ceilings`).
+pub fn computeAtComptime(comptime tasks: []const parser.Task) []const ResourceCeiling {
+    comptime {
+        var total: usize = 0;
+        for (tasks) |t| total += t.resources.len;
+
+        // Upper bound: one entry per resource mention; dedup below shrinks it.
+        var table: [total]ResourceCeiling = undefined;
+        var len: usize = 0;
+        for (tasks) |task| {
+            for (task.resources) |res| {
+                var found = false;
+                for (table[0..len]) |*entry| {
+                    if (std.mem.eql(u8, entry.name, res)) {
+                        found = true;
+                        if (task.priority > entry.ceiling) entry.ceiling = task.priority;
+                        break;
+                    }
+                }
+                if (!found) {
+                    table[len] = .{ .name = res, .ceiling = task.priority };
+                    len += 1;
+                }
+            }
+        }
+
+        // Insertion sort by name: trivial, stable, and no need to pull a
+        // generic sort into comptime evaluation. Keeps the table identical
+        // to what the runtime `compute` would produce.
+        var i: usize = 1;
+        while (i < len) : (i += 1) {
+            const item = table[i];
+            var j = i;
+            while (j > 0 and std.mem.order(u8, table[j - 1].name, item.name) == .gt) : (j -= 1) {
+                table[j] = table[j - 1];
+            }
+            table[j] = item;
+        }
+
+        // The finished table must end up owned by a `const` value: the
+        // compiler refuses to let globals or runtime code reference comptime
+        // memory owned by a `var`. Copying into this const struct makes the
+        // table an ordinary piece of the binary's static data, and slicing
+        // it is then legal anywhere — in `pub const`s, in the glue, or from
+        // runtime code in the CLI.
+        const Table = struct {
+            entries: [total]ResourceCeiling,
+            len: usize,
+        };
+        const frozen: Table = .{ .entries = table, .len = len };
+        return frozen.entries[0..frozen.len];
+    }
+}
+
 const testing = std.testing;
 
 test "ceiling is the max priority of accessing tasks" {
@@ -103,4 +162,25 @@ test "tasks without resources contribute nothing" {
     defer gpa.free(ceilings);
 
     try testing.expectEqual(@as(usize, 0), ceilings.len);
+}
+
+test "computeAtComptime is checked by the compiler itself" {
+    const tasks = [_]parser.Task{
+        .{ .task_id = "t0", .interrupt_id = "TIMER0", .priority = 1,
+           .resources = &.{ "res_a", "res_b" } },
+        .{ .task_id = "t1", .interrupt_id = "TIMER1", .priority = 2,
+           .resources = &.{ "res_b", "res_c" } },
+    };
+    // Entirely inside `comptime`: if the tables below are even one entry
+    // wrong, this file does not compile — the test *is* the assertion.
+    comptime {
+        const ceilings = computeAtComptime(&tasks);
+        if (ceilings.len != 3) @compileError("wrong number of ceilings");
+        if (!std.mem.eql(u8, ceilings[0].name, "res_a") or ceilings[0].ceiling != 1)
+            @compileError("res_a ceiling wrong");
+        if (!std.mem.eql(u8, ceilings[1].name, "res_b") or ceilings[1].ceiling != 2)
+            @compileError("res_b ceiling wrong"); // max(1, 2)
+        if (!std.mem.eql(u8, ceilings[2].name, "res_c") or ceilings[2].ceiling != 2)
+            @compileError("res_c ceiling wrong");
+    }
 }
