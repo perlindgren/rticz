@@ -26,11 +26,20 @@
 //! cannot be read at comptime, so the walk asks only
 //! `@TypeOf(@field(app, name))` — a type question that comptime can
 //! answer for `var`s, `const`s and functions alike — and evaluates
-//! `@field` only after the signature test has skipped the non-fns.
+//! `@field` only after the type test has skipped the non-fns.
 //! And the walk must run in the framework (glue), never in root: a
 //! `const` in root whose initializer reads root's own declarations
 //! via `@field` is a self-dependency Zig rejects.  Hence
 //! `namedTasks` takes the application namespace from the outside.
+//!
+//! Task handlers take a per-task *context* (RTIC's `Context`): the
+//! `Ctx` type function derives that struct — one field per accessed
+//! resource, named by the store and typed `*T` over the instance —
+//! from the same address identity the analysis uses.  Handlers
+//! therefore no longer share a signature, which is why a task's
+//! `task_id` reference is an erased address: the config needs
+//! identity, and the generated trampoline's call is what checks the
+//! signature.
 
 const std = @import("std");
 
@@ -47,7 +56,13 @@ pub const IdleHandler = *const fn () noreturn;
 pub const Task = struct {
     /// The task *is* its handler: a reference to a function in the
     /// application namespace.  Resolved to a name for the analysis.
-    task_id: Handler,
+    /// The pointer is type-erased because handlers no longer share a
+    /// signature — each takes its own context struct (see `Ctx`) —
+    /// and all the config needs from the reference is *identity*,
+    /// which is what the address carries.  The signature is checked
+    /// where it matters: the generated trampoline calls the handler
+    /// with a context literal that must type-check against it.
+    task_id: *const anyopaque,
     interrupt_id: []const u8,
     priority: u8,
     /// Pointers to the resource instances this task accesses.  The
@@ -85,14 +100,27 @@ pub const Config = struct {
 /// different address).  Handlers live at file scope or arrive through
 /// an alias; either way they are addressable declarations here.
 ///
+/// `handler` may be a typed function pointer or an erased address
+/// (task references are erased now that each handler takes its own
+/// context type); the comparison is by address either way.  Any
+/// function signature qualifies: with per-task contexts there is no
+/// single signature to test for, and the trampoline call type-checks
+/// what the config referenced.
+///
 /// The walk stays legal even when the namespace holds `var`s (like
 /// `resources`) that comptime may not evaluate: each declaration is
 /// first asked for its *type* — `@TypeOf(@field(...))` is a type
 /// question comptime can answer for `var`s, `const`s and functions
-/// alike — and `@field` is only evaluated once the signature test has
+/// alike — and `@field` is only evaluated once the type test has
 /// skipped the non-fns.
 pub fn handlerName(comptime handlers_ns: type, comptime handler: anytype) ?[]const u8 {
-    const target = @typeInfo(@TypeOf(handler)).pointer.child;
+    // Identity by pointer equality, not integer addresses: a
+    // function's address is a link-time fact, so `@intFromPtr` cannot
+    // run at comptime — but comparing two pointers for identity can,
+    // which is exactly the question.  Erasing to `*const anyopaque`
+    // puts a typed function pointer and the config's erased task
+    // reference into the same comparable shape.
+    const target: *const anyopaque = handler;
     // `inline` is essential: the iteration value feeds `@field`, which
     // needs the name comptime-known, and plain for-loops do not give
     // that even to a comptime-evaluated function.
@@ -107,17 +135,88 @@ pub fn handlerName(comptime handlers_ns: type, comptime handler: anytype) ?[]con
         // pass the app compiles against the empty stub, and that
         // analysis would (rightly) reject it.  Handlers are the
         // application's *other* functions; these two names stay out
-        // of the walk.  (Shape is load-bearing: the guard must be a
-        // short-circuit operand, not an `if … continue` — comptime
-        // flow control inside a block that a runtime instantiation
-        // also sees is rejected, and this generic does get
-        // instantiated from runtime code.)
+        // of the walk.  (Shape is load-bearing: the guards must be
+        // short-circuit operands, not `if … continue` — comptime flow
+        // control inside a block that a runtime instantiation also
+        // sees is rejected, and this generic does get instantiated
+        // from runtime code.)
         const is_contract = std.mem.eql(u8, name, "config") or std.mem.eql(u8, name, "tasks");
-        if (!is_contract and @TypeOf(@field(handlers_ns, name)) == target) {
-            if (std.meta.eql(handler, &@field(handlers_ns, name))) return name;
-        }
+        if (!is_contract and @typeInfo(@TypeOf(@field(handlers_ns, name))) == .@"fn" and
+            std.meta.eql(target, @as(*const anyopaque, &@field(handlers_ns, name)))) return name;
     }
     return null;
+}
+
+/// The field name of the store `store_ptr` points at whose instance
+/// `res_ptr` addresses — or null if the pointer addresses nothing in
+/// the store.  The address *is* the identity of a resource, so this
+/// is the question "which resource is this?" asked in the store's
+/// vocabulary.  Runs at comptime; takes the store by pointer because
+/// the store is a `var` whose value comptime may not evaluate, while
+/// the addresses of its fields are known.
+pub fn resourceName(comptime store_ptr: anytype, comptime res_ptr: *anyopaque) ?[]const u8 {
+    const store_info = @typeInfo(@typeInfo(@TypeOf(store_ptr)).pointer.child).@"struct";
+    inline for (store_info.field_names) |field_name| {
+        const candidate: *anyopaque = @ptrCast(&@field(store_ptr.*, field_name));
+        if (std.meta.eql(res_ptr, candidate)) return field_name;
+    }
+    return null;
+}
+
+/// The field names behind a whole access list, in order — the names a
+/// task context uses as field names, and the vector trampoline uses
+/// to build its context literal.  The result points into constant
+/// memory, so it may escape a comptime evaluation.
+pub fn resourceNames(comptime store_ptr: anytype, comptime accesses: []const *anyopaque) []const []const u8 {
+    var items: [accesses.len][]const u8 = undefined;
+    for (accesses, 0..) |res_ptr, i| {
+        items[i] = resourceName(store_ptr, res_ptr) orelse {
+            @compileError("a task references a resource that is not a field of the application resource store");
+        };
+    }
+    const Frozen = struct { names: [accesses.len][]const u8 };
+    const frozen: Frozen = .{ .names = items };
+    return &frozen.names;
+}
+
+/// The context type of a task: one public field per accessed resource
+/// — named exactly as the store field it reaches, typed `*T` over the
+/// instance.  This is the RTIC ctx struct; the bare pointer is the
+/// proxy for now, and ceiling-aware wrappers (an exclusive handle at
+/// the task's priority, a lock at a lower one) replace the field type
+/// without changing any of the code written against it.
+///
+/// The type is *derived*, not emitted into a file: it is computed by
+/// the compiler, from the task's access list, on every build — which
+/// is the codegen Zig can do itself, and does before any hand of
+/// codegen is possible: the handler signatures name these types, and
+/// the vector generator must compile the app *before* the vectors
+/// exist.  What genuinely needs codegen — a symbol named `TIMER0` —
+/// then builds an instance of this type and calls the handler with
+/// it, so the trampoline in `src/generated/irq.zig` is checked
+/// against this struct field-for-field, type-for-type.
+pub fn Ctx(comptime store_ptr: anytype, comptime accesses: []const *anyopaque) type {
+    const Store = @typeInfo(@TypeOf(store_ptr)).pointer.child;
+    var names: [accesses.len][]const u8 = undefined;
+    var types: [accesses.len]type = undefined;
+    var attrs: [accesses.len]std.builtin.Type.Struct.FieldAttributes = undefined;
+    for (accesses, 0..) |res_ptr, i| {
+        const name = resourceName(store_ptr, res_ptr) orelse {
+            @compileError("a task context reaches a resource that is not a field of the application resource store");
+        };
+        for (names[0..i]) |earlier| {
+            if (std.mem.eql(u8, earlier, name)) {
+                @compileError(std.fmt.comptimePrint(
+                    "a task context lists resource '{s}' twice; a context has one field per resource",
+                    .{name},
+                ));
+            }
+        }
+        names[i] = name;
+        types[i] = *@FieldType(Store, name);
+        attrs[i] = .{};
+    }
+    return @Struct(.auto, null, &names, &types, &attrs);
 }
 
 /// The analysis-facing task list of an application: the same tasks as
@@ -149,9 +248,6 @@ pub fn namedTasks(
     comptime store_ptr: anytype,
     comptime handlers_ns: type,
 ) []const parser.Task {
-    const Store = @typeInfo(@TypeOf(store_ptr)).pointer.child;
-    const store_info = @typeInfo(Store).@"struct";
-
     const count = tasks.len + 1;
 
     // One uniform view for the two passes: the interrupt tasks, then
@@ -174,8 +270,7 @@ pub fn namedTasks(
         entries[ti] = .{
             .name = handlerName(handlers_ns, task.task_id) orelse {
                 @compileError("the application config references a task handler that is not a " ++
-                    "`pub fn <name>() void` declared in the application namespace " ++
-                    "(or an alias of one)");
+                    "`pub fn <name>` declared in the application namespace (or an alias of one)");
             },
             .interrupt_id = task.interrupt_id,
             .priority = task.priority,
@@ -202,15 +297,7 @@ pub fn namedTasks(
 
     for (entries, 0..) |entry, ti| {
         for (entry.resources, 0..) |res_ptr, ri| {
-            var found: ?[]const u8 = null;
-            inline for (store_info.field_names) |field_name| {
-                const candidate: *anyopaque = @ptrCast(&@field(store_ptr.*, field_name));
-                if (std.meta.eql(res_ptr, candidate)) {
-                    found = field_name;
-                    break;
-                }
-            }
-            pool_items[total + ri] = found orelse {
+            pool_items[total + ri] = resourceName(store_ptr, res_ptr) orelse {
                 @compileError(std.fmt.comptimePrint(
                     "task '{s}' references a resource that is not a field of " ++
                         "the application resource store",
@@ -352,4 +439,38 @@ test "resolved names feed the ceiling analysis unchanged" {
         try std.testing.expectEqualStrings("counter1", ceilings[0].name);
         try std.testing.expectEqual(@as(u8, 2), ceilings[0].ceiling);
     }
+}
+
+test "a task context names its accesses and holds a proxy over each" {
+    const C = Ctx(&test_store, &.{ &test_store.counter1, &test_store.flag });
+    const info = @typeInfo(C).@"struct";
+    try std.testing.expectEqual(@as(usize, 2), info.field_names.len);
+    try std.testing.expectEqualStrings("counter1", info.field_names[0]);
+    try std.testing.expectEqual(*u64, info.field_types[0]);
+    try std.testing.expectEqualStrings("flag", info.field_names[1]);
+    try std.testing.expectEqual(*bool, info.field_types[1]);
+}
+
+test "context fields reach the very storage instances they name" {
+    const C = Ctx(&test_store, &.{&test_store.counter1});
+    // `const` ctx: the struct itself is fixed; what mutates is the
+    // storage its proxy reaches — which is precisely the point.
+    const ctx: C = .{ .counter1 = &test_store.counter1 };
+    const before = test_store.counter1;
+    ctx.counter1.* += 5;
+    try std.testing.expectEqual(before + 5, test_store.counter1);
+}
+
+test "a handler taking its context is still found by address" {
+    const C = Ctx(&test_store, &.{&test_store.counter2});
+    // A handler of the new shape — it takes a context, not nothing.
+    const Handlers = struct {
+        pub fn bump(ctx: C) void {
+            ctx.counter2.* += 1;
+        }
+    };
+    try std.testing.expectEqualStrings("bump", handlerName(Handlers, &Handlers.bump).?);
+    // ...and the config's erased reference resolves the same way.
+    const erased: *const anyopaque = &Handlers.bump;
+    try std.testing.expectEqualStrings("bump", handlerName(Handlers, erased).?);
 }

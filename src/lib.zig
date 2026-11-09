@@ -26,7 +26,10 @@ pub const ResourceConfig = resource.Config;
 /// storage by identity.
 pub const ResourceTask = resource.Task;
 
-/// The required signature of a task handler (and of init): `fn() void`.
+/// The required signature of the init handler: `fn() void` — it runs
+/// before contexts exist.  Interrupt task handlers take their own
+/// context struct instead (see `resource.Ctx`), so the task table
+/// references them by erased address.
 pub const Handler = resource.Handler;
 
 /// The required signature of the idle handler: `fn() noreturn`.

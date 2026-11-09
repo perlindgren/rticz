@@ -6,8 +6,10 @@
 //! when the line fires.  Nothing about that placement is expressible
 //! in the Zig compiler proper, so it is the one piece of the system
 //! that genuinely needs codegen: this tool emits, per config task, a
-//! trampoline named after the task's `interrupt_id` that calls
-//! straight through to the task's handler.
+//! trampoline named after the task's `interrupt_id` that *creates
+//! the task's context* — one field per accessed resource, naming the
+//! very instances the config declares — and calls the handler with
+//! it.
 //!
 //! The chicken-and-egg this creates, and how it is broken:
 //!
@@ -117,8 +119,25 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
 
-        try w.print("/// interrupt {s} → task {s}\n", .{task.interrupt_id, handler_name});
-        try w.print("pub fn {s}() void {{ app.{s}(); }}\n\n", .{ task.interrupt_id, handler_name });
+        // The context literal's fields: the store names behind the
+        // task's access list, resolved by the very identity walk that
+        // built the handler's own context type (`Ctx`) — so the
+        // literal the hardware entry point constructs is checked,
+        // field for field and type for type, against what the handler
+        // declares it receives.  This line is where the erased
+        // `task_id` reference gets its type checked.
+        const res_names = comptime rticz.resource.resourceNames(&app.resources, task.resources);
+
+        try w.print("/// interrupt {s} → task {s} (ctx: ", .{ task.interrupt_id, handler_name });
+        for (res_names, 0..) |res_name, j| {
+            try w.print("{s}{s}", .{ if (j != 0) ", " else "", res_name });
+        }
+        try w.print(")\n", .{});
+        try w.print("pub fn {s}() void {{ app.{s}(.{{", .{ task.interrupt_id, handler_name });
+        for (res_names, 0..) |res_name, j| {
+            try w.print("{s} .{s} = &app.resources.{s}", .{ if (j != 0) "," else "", res_name, res_name });
+        }
+        try w.print(" }}); }}\n\n", .{});
     }
 
     try w.flush();

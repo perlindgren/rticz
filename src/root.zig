@@ -6,17 +6,21 @@
 //! `config` is the single source of truth: the glue layer reads it,
 //! derives the resource ceilings and the task table from it at
 //! compile time, and prints the report in `main`.  Nothing is parsed,
-//! and the Zig compiler *is* the generator — for all but one thing:
-//! the interrupt vector table.  On hardware a task is reached through
-//! a function whose name is the vector's name, and no amount of
-//! comptime reflection places symbols in a vector table, so exactly
-//! one module is generated from this app: one trampoline per
-//! `interrupt_id`, by src/extract.zig, imported as `vectors` below.
+//! and the Zig compiler *is* the generator — for all but one thing.
+//! Even RTIC's per-task context structs are its work: `Ctx` builds
+//! each one from the task's declared accesses (see `t0_ctx`).  What
+//! remains for codegen is the interrupt vector table: on hardware a
+//! task is reached through a function whose name is the vector's
+//! name, and no amount of comptime reflection places symbols in a
+//! vector table, so exactly one module is generated from this app:
+//! one trampoline per `interrupt_id` — which creates the task's
+//! context instance and calls its handler — by src/extract.zig,
+//! imported as `vectors` below.
 //!
-//! Handlers are plain file-scope functions, so a config entry is
-//! simply `.task_id = t0`.  A handler may as well come from another
-//! file — `const t0 = @import("irq.zig").t0;` — an imported alias is
-//! just as addressable.
+//! Handlers are plain file-scope functions taking their context, so a
+//! config entry is simply `.task_id = &t0`.  A handler may as well
+//! come from another file — `const t0 = @import("irq.zig").t0;` — an
+//! imported alias is just as addressable.
 
 const std = @import("std");
 const rticz = @import("rticz");
@@ -39,16 +43,16 @@ const vectors = @import("vectors");
 /// writing — a cycle the build resolves by generating first.
 pub const tasks: []const rticz.ResourceTask = &.{
     .{
-        .task_id = t0,
+        .task_id = &t0,
         .interrupt_id = "TIMER0",
         .priority = 1,
-        .resources = &.{ &resources.res_a, &resources.res_b },
+        .resources = t0_resources,
     },
     .{
-        .task_id = t1,
+        .task_id = &t1,
         .interrupt_id = "UART0",
         .priority = 2,
-        .resources = &.{ &resources.res_b, &resources.res_c },
+        .resources = t1_resources,
     },
 };
 
@@ -68,18 +72,41 @@ pub const config: rticz.ResourceConfig = .{
     .tasks = tasks,
 };
 
-/// Every interrupt context of the application would be a handler of
-/// this shape.  The host build reaches them through the generated
-/// vector functions — the same path the core takes on hardware, with
-/// idle's calls standing in for the interrupt lines firing.
+/// Each task's resource accesses, declared exactly once and used
+/// twice: they *are* the context the handler receives (below), and
+/// they are what the task table records for the analysis.  One list,
+/// two readers — the declaration and the proxy struct can never
+/// disagree.
+const t0_resources: []const *anyopaque = &.{ &resources.res_a, &resources.res_b };
+const t1_resources: []const *anyopaque = &.{ &resources.res_b, &resources.res_c };
+
+/// RTIC's task context, derived: one field per accessed resource,
+/// named as the store field, typed `*T` — the proxy over the very
+/// instance the config declares.  `Ctx` computes the struct at
+/// compile time from the list above; on real RTIC a codegen pass
+/// writes these structs out, but a type the compiler builds from the
+/// declaration is the same artifact with no chance of drift.  (What
+/// codegen genuinely owns is the *name* of the vector symbol — and
+/// the generated trampoline builds this struct, so the field names
+/// and types are checked exactly there.)
+pub const t0_ctx = rticz.resource.Ctx(&resources, t0_resources);
+pub const t1_ctx = rticz.resource.Ctx(&resources, t1_resources);
+
+/// The interrupt tasks arrive with their context: every access to
+/// shared state goes through a field of it, never through
+/// `resources` directly — which is exactly what makes the config's
+/// resource list more than documentation.  The host build reaches
+/// handlers through the generated vector functions, which *create*
+/// the context instance — the same path the core takes on hardware,
+/// with idle's calls standing in for the interrupt lines firing.
 ///
 /// A handler referenced from the system definition is part of the
 /// application's visible surface: the framework resolves references by
 /// walking the module's *public* declarations, so `t0` and `t1` are
 /// `pub` — exactly what a name-based config could name across files.
-pub fn t0() void {
-    resources.res_a += 1;
-    resources.res_b.x += 1;
+pub fn t0(ctx: t0_ctx) void {
+    ctx.res_a.* += 1;
+    ctx.res_b.x += 1;
     // A handler can ask its own priority — from the config table, at
     // comptime, off the function's own address.
     comptime {
@@ -87,9 +114,9 @@ pub fn t0() void {
     }
 }
 
-pub fn t1() void {
-    resources.res_b.y += 1;
-    resources.res_c.set("from t1") catch {};
+pub fn t1(ctx: t1_ctx) void {
+    ctx.res_b.y += 1;
+    ctx.res_c.set("from t1") catch {};
 }
 
 /// The priority assigned to `handler` in the task table (which
@@ -104,9 +131,13 @@ pub fn t1() void {
 /// comptime self-lookup would otherwise materialize the full config,
 /// idle included, wherever only the handler is needed — such as the
 /// vector generator's pass, which runs before idle's vectors exist.
-pub inline fn priorityOf(comptime handler: rticz.Handler) u8 {
+pub inline fn priorityOf(comptime handler: anytype) u8 {
+    // Pointer identity, not `@intFromPtr`: a function's address is a
+    // link-time fact, but identity is a comptime question — and the
+    // erased `task_id` in the table gives the common shape.
+    const self: *const anyopaque = handler;
     for (tasks) |task| {
-        if (task.task_id == handler) return task.priority;
+        if (std.meta.eql(self, task.task_id)) return task.priority;
     }
     @compileError("handler is not declared in config");
 }

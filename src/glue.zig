@@ -53,11 +53,15 @@ pub const idle_name = rticz.resource.handlerName(app, app.config.idle.task_id) o
     @compileError("the application config references an idle handler that is not a function declared in the application namespace");
 
 /// A dispatch table: the glue's view of the tasks, as data.  The
-/// `handler` is the very function the config references.
+/// `handler` is the very function the config references.  It is held
+/// as an address because handlers take per-task contexts and
+/// therefore share no signature; on hardware this table *is* what the
+/// vector entry points at — the generated trampoline, which builds
+/// the context and makes the typed call.
 pub const Dispatch = struct {
     task_id: []const u8,
     priority: u8,
-    handler: rticz.Handler,
+    handler: *const anyopaque,
 };
 
 /// The table is built in a comptime var, then frozen into a `const`:
@@ -87,9 +91,11 @@ comptime {
 }
 
 comptime {
-    // Every handler must be a plain `fn () void` — the config type
-    // already guarantees it, so there is nothing left to check except
-    // that the tables agree with each other.
+    // Nothing here can check handler signatures — each handler takes
+    // its own context type — but nothing needs to: the generated
+    // trampoline calls the handler with a context literal that must
+    // type-check against it.  All that is left to verify is that the
+    // tables agree with each other.
     if (dispatch.len != tasks.len) @compileError("dispatch table out of sync");
 }
 
