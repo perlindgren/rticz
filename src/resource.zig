@@ -1,7 +1,8 @@
 //! The typed application side: resources as real Zig declarations and
 //! tasks referenced by their handler functions.
 //!
-//! The application writes its system definition in `src/root.zig` as
+//! The application writes its system definition in its root (see
+//! `examples/beats/root.zig`) as
 //! one `config`: each resource is its own `pub var` — placeable in its
 //! own linker section or alignment — each interrupt task is a row
 //! naming its handler, its line, its priority and its resource
@@ -48,7 +49,7 @@
 //! plain struct named after the *task* — `context.t0`, not
 //! `context.TIMER0`, exactly as RTIC hands `Context<T0>` to the task
 //! that binds an interrupt — generated into
-//! `src/generated/context.zig` by `codegen/generate.zig` from the
+//! the application's `generated/context.zig` by `codegen/generate.zig` from the
 //! very `config` declared here: one struct per declared name,
 //! fields one per accessed resource, a `Claim(name, T, ceiling)`
 //! proxy over the application's declaration — the resource's name
@@ -642,7 +643,7 @@ test "resolved names feed the ceiling analysis unchanged" {
 
 test "a handler taking its context is still found by address" {
     // The new-world shape: the context is a plain struct named after
-    // the task — exactly what src/generated/context.zig holds.
+    // the task — exactly what a generated context.zig holds.
     const CtxX = struct { counter2: *u64 };
     const Handlers = struct {
         pub fn bump(ctx: CtxX) void {

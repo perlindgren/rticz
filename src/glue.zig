@@ -1,8 +1,11 @@
 //! The glue: the minimum runtime that boots the system declared by the
 //! application.
 //!
-//! This module is the entry point of the produced binary.  It reads
-//! `app.config` — the one system definition in `src/root.zig` — and
+//! This module is the entry point of the produced binary — wired
+//! into the *application's* build, which imports it from the rticz
+//! package and hands it the app, context, and vectors modules.  It
+//! reads `app.config` — the one system definition in the
+//! application's root.zig — and
 //! turns its declarations into the analysis vocabulary: interrupt
 //! tasks already *name* their handlers, so their rows are read as
 //! written; the two references the config holds, init and idle, are
@@ -16,7 +19,9 @@
 //! names), and `main` calls exactly the functions the config names.
 
 const std = @import("std");
-const app = @import("app"); // the application root, src/root.zig — NOT
+const app = @import("app"); // the application root — the example's
+// root.zig, wired in by the application's
+// build — NOT
 const rticz = @import("rticz"); // @import("root"), which would be *this*
 // file when glue is the executable entry
 const context = @import("context"); // the generated task contexts: idle

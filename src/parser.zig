@@ -2,7 +2,7 @@
 //!
 //! The data model (`Task`, `Config`) is the core; there are two frontends:
 //!
-//! * The application root (`src/root.zig`) declares its configuration as a
+//! * The application root (see `examples/beats/root.zig`) declares its configuration as a
 //!   Zig constant whose tasks reference resource *storage* by address — see
 //!   `resource.Config`. The compiler resolves those references to declared
 //!   field names, producing exactly the name-based `Task` table defined
@@ -224,7 +224,7 @@ test "rejects out-of-range priority" {
 
 test "comptimeValidate accepts a well-formed compile-time config" {
     // The failure paths are @compileError — they cannot be caught by a test,
-    // but they are exercised by the build itself (see src/root.zig).
+    // but they are exercised by the build itself (see examples/beats/root.zig).
     comptimeValidate(&.{
         .{ .task_id = "t0", .interrupt_id = "TIMER0", .priority = 1, .resources = &.{ "res_a", "res_b" } },
         .{ .task_id = "t1", .interrupt_id = "TIMER1", .priority = 2, .resources = &.{"res_c"} },

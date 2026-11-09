@@ -7,7 +7,7 @@
 //! table: a function whose *name* is the vector's name (`TIMER0`,
 //! `UART0`) that the core calls when the line fires.  Neither is
 //! something Zig derives from the application by itself, so both are
-//! generated, into src/generated/ (git-ignored, but in the tree for
+//! generated, into the application's generated/ folder (git-ignored, but in the tree for
 //! anyone to read, rewritten on every build):
 //!
 //! *   `context.zig` — one context struct per task, named after it
@@ -54,8 +54,8 @@ const appsrc = @import("appsrc.zig");
 const context_header =
     \\//! GENERATED FILE — do not edit.
     \\//!
-    \\//! Task contexts for the application in src/root.zig, emitted
-    \\//! by codegen/generate.zig from `pub const config` during
+    \\//! Task contexts for the application beside it (root.zig), emitted
+    \\//! by rticz's codegen/generate.zig from `pub const config` during
     \\//! `zig build`, which rewrites this file on every run.
     \\//! Git-ignored: here to be read, not to be committed.
     \\//!
@@ -78,8 +78,9 @@ const context_header =
 const irq_header =
     \\//! GENERATED FILE — do not edit.
     \\//!
-    \\//! Interrupt vectors for the application in src/root.zig, emitted
-    \\//! by codegen/generate.zig from `pub const config` during `zig build`,
+    \\//! Interrupt vectors for the application beside it (root.zig),
+    \\//! emitted by rticz's codegen/generate.zig from `pub const config`
+    \\//! during `zig build`,
     \\//! which rewrites this file on every run.  Git-ignored: here to
     \\//! be read, not to be committed.
     \\//! On real hardware these names are the symbols the linker places

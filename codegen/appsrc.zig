@@ -1,4 +1,4 @@
-//! The application reader: the config of `src/root.zig`, read as text.
+//! The application reader: the config of an application's `root.zig`, read as text.
 //!
 //! The generators must know the whole system definition — task names,
 //! interrupt lines, priorities, resource accesses — before a single

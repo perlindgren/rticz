@@ -1,5 +1,6 @@
 //! rticz-cli — command-line tool: print the resource ceiling analysis of
-//! the task configuration compiled into the binary (src/root.zig), or of
+//! the task configuration compiled into the binary (the application
+//! root it was wired against), or of
 //! any `rticz.json`-formatted file given as an argument.
 
 const std = @import("std");
@@ -15,7 +16,7 @@ const usage =
     \\
     \\With no FILE, prints the task table and resource priority ceilings
     \\computed at compile time from `pub const config` in the application
-    \\root (src/root.zig).
+    \\root this binary was built with.
     \\
     \\With a FILE, parses and analyzes an rticz.json-formatted configuration
     \\at runtime instead.
@@ -72,9 +73,9 @@ pub fn main(init: std.process.Init) !void {
     } else {
         // Default mode: zero-parse report. `glue.named_tasks` and
         // `glue.ceilings` are constants the compiler derived from
-        // `pub const config` in src/root.zig — this binary just prints the
-        // tables that are already baked into it.
-        try printReport(stdout, "compiled-in config (src/root.zig)", glue.named_tasks, glue.ceilings);
+        // `pub const config` in the application root — this binary
+        // just prints the tables that are already baked into it.
+        try printReport(stdout, "compiled-in config (root.zig)", glue.named_tasks, glue.ceilings);
     }
 
     try stdout.flush();

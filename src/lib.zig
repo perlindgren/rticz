@@ -6,7 +6,8 @@
 //! the name-based (JSON) data model, which lives at `rticz.parser`,
 //! the JSON parser, and the resource ceiling analysis.
 //! (The *application* root — the file declaring `pub const config` and
-//! implementing init/idle/tasks — lives in `src/root.zig` and is separate
+//! implementing init/idle/tasks — lives in the application's own
+//! package, e.g. `examples/beats/root.zig`, and is separate
 //! from this library root on purpose.)
 
 const std = @import("std");
@@ -26,7 +27,7 @@ pub const Config = resource.Config;
 /// The required signature of the init handler: `fn() void` — it runs
 /// before contexts exist.  Interrupt task handlers take their own
 /// context struct instead — a plain struct named after the task,
-/// generated into src/generated/context.zig — which is why task rows
+/// generated into the application's generated/context.zig — which is why task rows
 /// name them rather than referencing them.
 pub const Handler = resource.Handler;
 
