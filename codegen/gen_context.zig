@@ -8,14 +8,25 @@
 //!
 //! ```zig
 //! pub const t0 = struct {
-//!     res_a: rticz.resource.Claim(@TypeOf(app.res_a)),
-//!     res_b: rticz.resource.Claim(@TypeOf(app.res_b)),
+//!     res_a: rticz.resource.Claim("res_a", @TypeOf(app.res_a), 1),
+//!     res_b: rticz.resource.Claim("res_b", @TypeOf(app.res_b), 2),
 //! };
 //! ```
 //!
 //! — each a `Claim` proxy over the application's own declaration, so
 //! the context always reaches the very instances the task claimed,
-//! whatever section or alignment those carry.
+//! whatever section or alignment those carry; and each carrying, in
+//! its type, the resource's name and priority ceiling — the highest
+//! priority of any task that touches it, computed here from the task
+//! table with the same analysis the glue runs.  The proxy cannot know
+//! either by itself: `claim` is a method on a struct whose only
+//! member is a pointer, so what a section must announce (whose
+//! resource, behind which mask) is baked into the field type.  On a
+//! Cortex-M the ceiling is what BASEPRI takes while the resource is
+//! claimed (RTIC raises it at every lock, and `claim` will too);
+//! until the runtime implements the masking, `claim` prints the
+//! raise and the restore around the section — `-- priority ceiling
+//! res_a 1` — and the type arguments are precisely what it prints.
 //!
 //! The chicken-and-egg this creates, and how it is broken, mirrors
 //! the vector generator — one floor deeper:
@@ -67,6 +78,56 @@ const Io = std.Io;
 const app = @import("app");
 const rticz = @import("rticz");
 
+/// Every resource's priority ceiling for this application, computed
+/// with the *same* ceiling analysis the glue runs — over the same
+/// facts: priorities and resource names straight from the
+/// handler-free `task_specs`, reshaped into the `parser.Task` rows
+/// the analysis takes (its `task_id` is here the spec's plain
+/// declared name, so reshaping drags no handler along).  The numbers
+/// this context bakes into its `Claim` fields and the numbers the
+/// glue banner prints cannot disagree, because both derive from the
+/// one declaration.  Idle is deliberately not a row: priority 0 is
+/// the floor, and when idle shares a resource it is the party *to be
+/// protected* — the mask protecting it is the other sharers'
+/// ceiling, which is exactly what this table states.
+const ceilings: []const rticz.ceiling.ResourceCeiling = table: {
+    var total: usize = 0;
+    for (app.task_specs) |spec| total += spec.resources.len;
+    const Rows = struct {
+        tasks: [app.task_specs.len]rticz.parser.Task,
+        pool: [total][]const u8,
+    };
+    const rows: Rows = rows: {
+        var r: Rows = .{ .tasks = undefined, .pool = undefined };
+        var pos: usize = 0;
+        for (app.task_specs, 0..) |spec, i| {
+            for (spec.resources, 0..) |res, j| r.pool[pos + j] = res.name;
+            r.tasks[i] = .{
+                .task_id = spec.name,
+                .interrupt_id = spec.interrupt_id,
+                .priority = spec.priority,
+                .resources = r.pool[pos..][0..spec.resources.len],
+            };
+            pos += spec.resources.len;
+        }
+        break :rows r;
+    };
+    break :table rticz.ceiling.computeAtComptime(&rows.tasks);
+};
+
+/// The ceiling a claim of `name` raises to: the highest priority of
+/// any *interrupt* task that declared the resource.  A resource only
+/// idle touches has no ceiling — no preempting task can race idle
+/// for it — and gets 0, the mask that blocks nothing; a real RTIC
+/// skips the raise for it, and the trace here prints what the
+/// register would take.
+fn ceilingFor(name: []const u8) u8 {
+    for (ceilings) |c| {
+        if (std.mem.eql(u8, c.name, name)) return c.ceiling;
+    }
+    return 0;
+}
+
 const header =
     \\//! GENERATED FILE — do not edit.
     \\//!
@@ -78,10 +139,13 @@ const header =
     \\//! One struct per task, named after the task (plus `idle`, the
     \\//! runtime's own context): the fields are that task's declared
     \\//! resources, each a `Claim` proxy over the application's own
-    \\//! declaration — so a handler reaches the instance it claimed,
-    \\//! and only inside a claimed critical section, and the generated
-    \\//! vector's context literal is checked against this struct,
-    \\//! field for field and type for type.
+    \\//! declaration carrying the resource's name and priority
+    \\//! ceiling in its type — so a handler reaches the instance it
+    \\//! claimed, only inside a claimed critical section, and under
+    \\//! the mask its ceiling names (printed for now; BASEPRI when
+    \\//! the runtime can), and the generated vector's context literal
+    \\//! is checked against this struct, field for field and type for
+    \\//! type.
     \\
     \\
     \\const app = @import("app");
@@ -192,13 +256,17 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// One context's fields: the resources the task declared, each a
-/// `Claim` proxy whose pointee type the application's declaration
-/// itself states — `@TypeOf(app.res_x)`, not a type name printed
+/// `Claim` proxy.  The pointee type is the application's declaration
+/// itself speaking — `@TypeOf(app.res_x)`, not a type name printed
 /// here: whatever the programmer writes at the declaration — a
 /// generic instance, a typedef — flows into the context without this
-/// file ever going stale.  Wrapped in `Claim`, the field hands the
-/// handler a proxy, not the reference: only `claim` opens it, and
-/// only for a critical section.
+/// file ever going stale.  The name and `ceilingFor(res)` ride in
+/// beside it because the proxy cannot introspect either — it is a
+/// struct whose only member is a pointer — yet `claim` must announce
+/// both, so the generator tells it: `Claim("res_a", …, 1)`.
+/// Wrapped in `Claim`, the field hands the handler a proxy, not the
+/// reference: only `claim` opens it, only for a critical section, and
+/// only behind the mask its ceiling names.
 fn emitFields(w: *Io.Writer, owner: []const u8, resources: []const rticz.resource.ResourceRef) !void {
     for (resources, 0..) |res, ri| {
         if (!rticz.parser.isZigIdentifier(res.name)) {
@@ -213,6 +281,6 @@ fn emitFields(w: *Io.Writer, owner: []const u8, resources: []const rticz.resourc
                 std.process.exit(1);
             }
         }
-        try w.print("    {s}: rticz.resource.Claim(@TypeOf(app.{s})),\n", .{ res.name, res.name });
+        try w.print("    {s}: rticz.resource.Claim(\"{s}\", @TypeOf(app.{s}), {d}),\n", .{ res.name, res.name, res.name, ceilingFor(res.name) });
     }
 }

@@ -47,9 +47,13 @@
 //! that binds an interrupt — generated into
 //! `src/generated/context.zig` by `codegen/gen_context.zig` from the
 //! very `task_specs` declared here: one struct per declared name,
-//! fields one per accessed resource, a `Claim(T)` proxy over the
-//! application's declaration (see `Claim` below): the handler reaches
-//! the data only inside a `claim`ed critical section.  The name lives
+//! fields one per accessed resource, a `Claim(name, T, ceiling)`
+//! proxy over the application's declaration — the resource's name
+//! and priority ceiling baked into the field type, the ceiling the
+//! same number the glue banner prints
+//! (see `Claim` below): the handler reaches the data only inside a
+//! `claim`ed critical section, under the mask that ceiling stands
+//! for.  The name lives
 //! in the spec as a plain string because the generator reads the
 //! handler-free declaration, and a task's name is only visible there
 //! as data — the vector generator, which does see the handlers,
@@ -69,8 +73,6 @@ const std = @import("std");
 
 /// The handler of an interrupt task, or of init.
 pub const Handler = *const fn () void;
-
-
 
 /// One claimed resource: its name, and the very instance it names.
 /// The pair is written as one atomic literal — `.res_a = &res_a` —
@@ -262,7 +264,22 @@ pub fn Config(comptime IdleCtx: type) type {
 /// Composing claims by *nesting* them (claim one, and claim the next
 /// inside its body) stays legal — different resources, different
 /// flags.
-pub fn Claim(comptime T: type) type {
+///
+/// `name` is the resource's declared name and `ceiling` its priority
+/// ceiling — the highest priority of any task that touches it — both
+/// baked in by the context generator, which knows them from the task
+/// table.  They ride in the *type* because the proxy cannot know
+/// them by introspection — it is a struct whose only member is a
+/// pointer; it is not told which field of which context it is — and
+/// both are per-resource compile-time facts.  On a Cortex-M the
+/// ceiling is the value BASEPRI takes for the duration of the
+/// section, the mask that makes the race structurally impossible.
+/// Until the runtime writes that register, `claim` traces the
+/// protocol instead: `-- priority ceiling res_a 1` before the
+/// section, `-- priority ceiling res_a restored` after — and only if
+/// the section really returns, because one that never does leaves the
+/// mask raised, and the trace saying so is the point of printing it.
+pub fn Claim(comptime name: []const u8, comptime T: type, comptime ceiling: u8) type {
     return struct {
         const Self = @This();
 
@@ -275,12 +292,15 @@ pub fn Claim(comptime T: type) type {
         /// Run `body` as the critical section, lending it the
         /// resource's reference.  `captured` is the fake closure's
         /// environment; the call to `body` is what types it against
-        /// the section.
+        /// the section.  Around it: the ceiling raise and restore,
+        /// printed for now, register-backed eventually.
         pub fn claim(self: *Self, comptime body: anytype, captured: anytype) void {
+            std.debug.print("-- priority ceiling {s} {d}\n", .{ name, ceiling });
             if (self.claimed) @panic("resource claimed while already claimed — compose by nesting *different* resources, never re-claim the same one");
             self.claimed = true;
             defer self.claimed = false;
             body(captured, self.ptr);
+            std.debug.print("-- priority ceiling {s} restored\n", .{name});
         }
     };
 }
@@ -580,7 +600,7 @@ test "claim lends a reference into the section and retracts it after" {
     };
 
     var value: u64 = 10;
-    var proxy = Claim(u64){ .ptr = &value };
+    var proxy = Claim("value", u64, 1){ .ptr = &value }; // name+ceiling: what claim traces
 
     proxy.claim(section.add_to, 5); // fake closure captures the 5
     try std.testing.expectEqual(@as(u64, 15), value);
@@ -597,7 +617,7 @@ test "claims of different resources compose by nesting" {
         }
     };
     const outer = struct {
-        fn nesting(nested: *Claim(u64), held: *u64) void {
+        fn nesting(nested: *Claim("b", u64, 2), held: *u64) void {
             held.* += 10;
             nested.claim(inner.into, {}); // claim B while holding A
         }
@@ -605,8 +625,8 @@ test "claims of different resources compose by nesting" {
 
     var a: u64 = 0;
     var b: u64 = 0;
-    var pa = Claim(u64){ .ptr = &a };
-    var pb = Claim(u64){ .ptr = &b };
+    var pa = Claim("a", u64, 1){ .ptr = &a };
+    var pb = Claim("b", u64, 2){ .ptr = &b };
 
     pa.claim(outer.nesting, &pb);
     try std.testing.expectEqual(@as(u64, 1), b); // inner ran

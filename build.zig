@@ -162,7 +162,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
     contexts_for_extract.addImport("app", app_for_extract);
-    contexts_for_extract.addImport("rticz", mod); // its fields are `Claim` proxies
+    contexts_for_extract.addImport("rticz", mod); // its fields are `Claim` proxies carrying name + ceiling
     app_for_extract.addImport("context", contexts_for_extract);
 
     const extract = b.addExecutable(.{
@@ -206,7 +206,7 @@ pub fn build(b: *std.Build) void {
     vectors_mod.addImport("app", app_mod);
     vectors_mod.addImport("context", contexts_mod); // trampolines name their context type
     contexts_mod.addImport("app", app_mod);
-    contexts_mod.addImport("rticz", mod); // its fields are `Claim` proxies
+    contexts_mod.addImport("rticz", mod); // its fields are `Claim` proxies carrying name + ceiling
     app_mod.addImport("vectors", vectors_mod);
     app_mod.addImport("context", contexts_mod);
 

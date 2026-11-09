@@ -47,9 +47,13 @@ pub const IdleSpec = resource.IdleSpec;
 pub const IdleTask = resource.IdleTask;
 
 /// A claimed-for-the-moment resource proxy — the type of a context
-/// field.  An app handler names it only through its context
-/// (`ctx.res.claim(...)`); the shorthand is here so a signature or
-/// helper can spell the type if it needs to.
+/// field: `Claim(name, T, ceiling)`, the resource's name and priority
+/// ceiling baked into the type by the context generator (the ceiling
+/// is the BASEPRI value the section will one day run behind; a trace
+/// line until then).  An app
+/// handler names it only through its context (`ctx.res.claim(...)`);
+/// the shorthand is here so a signature or helper can spell the type
+/// if it needs to.
 pub const Claim = resource.Claim;
 
 test {
