@@ -55,6 +55,9 @@ pub fn build(b: *std.Build) void {
     // the other way.
     const examples = [_][]const u8{
         "examples/beats",
+        // examples/beats_* are copies with one bug in each, to show
+        // the rejections; they are broken on purpose, so they are
+        // deliberately not built here — open one and `zig build`.
     };
 
     const examples_step = b.step("examples", "Build every example (each is its own package)");

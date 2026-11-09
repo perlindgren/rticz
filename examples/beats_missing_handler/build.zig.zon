@@ -1,0 +1,21 @@
+.{
+    // The beats example: a complete application *package*, not a file
+    // inside the library.  It depends on rticz exactly the way any
+    // outside application would — the only luxury of a path dependency
+    // is that no fetch or hash is involved; the dependency mechanics
+    // are identical to a URL dependency's.
+    .name = .beats,
+    .version = "0.0.0",
+    .fingerprint = 0xe262e962c3d8f8a6, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .rticz = .{
+            .path = "../../",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "root.zig",
+    },
+}
