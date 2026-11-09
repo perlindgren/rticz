@@ -102,8 +102,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "rticz", .module = rticz_mod }},
         }),
     });
-    // A run step's working directory is this package's root, and both
-    // files are written into the tree relative to it.
+    // A run step's working directory is this package's root, and all
+    // three files are written into the tree relative to it.
     const gen_code = b.addRunArtifact(generate_exe);
     gen_code.setName("gen-code");
     gen_code.addArg("root.zig");
