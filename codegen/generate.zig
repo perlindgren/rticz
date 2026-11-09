@@ -47,7 +47,10 @@
 //!
 //! Everything is validated before anything is written: a bad row
 //! stops the build with its message, and never leaves half a vector
-//! table on disk.
+//! table on disk.  And once the config is sound, the application's
+//! *text* is linted (codegen/lint.zig, over its import closure): the
+//! module graph walls the resources off, the lint answers the
+//! mistakes that try anyway in the application's own terms.
 //!
 //! Usage: `generate <app source> <storage output> <context output>
 //! <vectors output>` — paths as relative to the build root, which is
@@ -59,6 +62,7 @@ const Io = std.Io;
 
 const rticz = @import("rticz");
 const appsrc = @import("appsrc.zig");
+const lint = @import("lint.zig");
 
 const context_header =
     \\//! GENERATED FILE — do not edit.
@@ -157,6 +161,20 @@ pub fn main(init: std.process.Init) !void {
         error.Malformed => std.process.exit(1),
         error.OutOfMemory => {
             std.debug.print("generate: out of memory reading the app\n", .{});
+            std.process.exit(1);
+        },
+    };
+
+    // The lint: the wall is the module graph, the manners are here —
+    // bare resource names, proxy `.ptr` reads, imports reaching into
+    // generated code, all answered in the application's terms before
+    // the compiler gets a chance to be cryptic.  It needs the
+    // declared names, so it runs after the read, and before anything
+    // is written.
+    lint.lint(io, arena, app_path, app.resources) catch |err| switch (err) {
+        error.Lint => std.process.exit(1),
+        error.OutOfMemory => {
+            std.debug.print("generate: out of memory linting the app\n", .{});
             std.process.exit(1);
         },
     };
