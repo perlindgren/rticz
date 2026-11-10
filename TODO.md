@@ -32,8 +32,9 @@ resume it.  Ordered by "would do next", not by size.
 
 ## Enforcement of the claim protocol
 
-The three raw-access holes are documented in `src/resource.zig`
-(*What this does not prevent*).  As of 2026-11-10 two tiers are
+The three raw-access holes are documented in `ENFORCEMENT.md`
+(*What this does not prevent* lives there now, with a worked example
+of the open hole).  As of 2026-11-10 two tiers are
 built and the hole count reflects it:
 
 - [x] Tier B — language wall (built): resource storage is a generated

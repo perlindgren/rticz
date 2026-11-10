@@ -281,51 +281,23 @@ pub fn Config(comptime IdleCtx: type) type {
 /// ## What this does not prevent
 ///
 /// The guard is a runtime echo of the borrow check, not the borrow
-/// check.  One of the three raw accesses an application could reach
-/// is now closed by construction, and the other two survive as
-/// honest holes:
+/// check.  The full ledger — the three raw accesses, what closes
+/// each, a worked example of the one that stays open, and the two
+/// rules generated code must observe (never `noalias`, never
+/// `unreachable` as a should-not) — lives in `ENFORCEMENT.md` at
+/// the root of this repository.  In one line:
 ///
-///   1. ~~Write the declaration directly.~~  Closed: the declaration
-///      is not in the application anymore.  `config.resources`
-///      describes the storage, the generator emits it into
-///      `generated/storage.zig`, and the application's build wires no
-///      import edge to that module — no file of the application, at
-///      any import depth, can name it.  This is what real RTIC gets
-///      from Rust's module privacy; here it is a graph-visibility
-///      fact, not a text rule.  (What remains nameable is the
-///      *pointer* a claim lends — which is hole 3, not this one.)
-///   2. Read through the proxy: `ctx.res_a.ptr.*` is nine characters
-///      to raw memory, because `ptr` is an ordinary struct field and
-///      Zig has no private fields.  A generator *lint* rejects any
-///      `.ptr` in the application's text (and the text of everything
-///      it imports) — a convention enforced at the build, not a type
-///      rule; aliasing tricks like `var p = ctx.res_a.ptr;` are
-///      caught by the same token, hiding behind them needs a
-///      deliberately indirect program.
-///   3. Stash the `*T` the claim lends and use it after the section
-///      ends.  The retraction is ceremony; making references expire
-///      needs a borrow checker — the real foundation of Rust RTIC,
-///      and the reason its locks are compile-time facts.
+///   1. Writing the declaration directly — closed by construction:
+///      the storage is a generated module the application has no
+///      import edge to.
+///   2. Reading through the proxy's `.ptr` — closed by the
+///      generator's lint over the application's import closure.
+///   3. Stashing the lent `*T` and using it after the section —
+///      open; the self-destructing wrapper that would narrow it is
+///      Tier C in `TODO.md`.
 ///
-/// Two rules follow for everything this project generates:
-///
-///   * Never emit `noalias`.  With no type-based alias analysis to
-///     contradict it (verified: the app's ReleaseFast IR carries zero
-///     `!tbaa` annotations), an honest-sounding `noalias` on anything
-///     user code reaches lets the optimizer assume away the very
-///     sharing the guard exists to catch.
-///   * Never use `unreachable` to mean "the application should not do
-///     this".  ReleaseFast deletes `unreachable` guards entirely —
-///     probed: the double-claim check vanished, 2 raises, 0 restores,
-///     segfault.  App misbehavior must meet `@panic` or
-///     `@compileError`, which survive every optimization mode.
-///
-/// What remains beyond these pages: a checked wrapper in place of
-/// the lent `*T` (closes 3's ordinary uses; cannot intercept methods
-/// mid-call) — considered and deliberately deferred.  For everything
-/// else the honest answer stands: the protocol is guarded against
-/// accidents, the storage is unreachable by construction, and only a
-/// program written to evade the model still can.
+/// App misbehavior must meet `@panic` or `@compileError`, which
+/// survive every optimization mode.
 pub fn Claim(comptime name: []const u8, comptime T: type, comptime ceiling: u8) type {
     return struct {
         const Self = @This();
